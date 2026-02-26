@@ -33,12 +33,15 @@
 	"profiles": [
 		{
 			"platform": "hoyolab",
-			"cookies": "mi18nLang=en-us; ltoken=cKhM62EsX3A5cyrNNLoBvafUQJTFN7xnhA1GEZNf; ltuid=106999666;"
+			"ltoken": "cKhM62EsX3A5cyrNNLoBvafUQJTFN7xnhA1GEZNf",
+			"ltuid": "106999666"
 		},
 		{
 			"platform": "hoyolab",
 			"console_name": "USER2",
-			"cookies": "mi18nLang=en-us; ltoken_v2=v2_JAiZ2yokLnl8MBNkGZftiKNO1AAqmAeQeY1hmS4bg92wb0IdkpAB8sNMY30ZBvtxG0NjNzulXKRb-GEcAjgML2GGTLRy-PlETlw9IgYtSoMNOMdLQtQz81kkFgTVYcfxWSMAAA3ASEcO8gNFC0ncUCIJz0FGnNY3QOxWI1ZM0LQ6GUECT5MrJEApRE9gYp4CoCjs2PE55G.yM1su.MnZDTZiGQpMcG3; ltuid_v2=110666115; ltmid_v2=hg_6fuk18lovy;"
+			"ltoken_v2": "v2_JAiZ2yokLnl8MBNkGZftiKNO1AAqmAeQeY1hmS4bg92wb0IdkpAB8sNMY30ZBvtxG0NjNzulXKRb-GEcAjgML2GGTLRy-PlETlw9IgYtSoMNOMdLQtQz81kkFgTVYcfxWSMAAA3ASEcO8gNFC0ncUCIJz0FGnNY3QOxWI1ZM0LQ6GUECT5MrJEApRE9gYp4CoCjs2PE55G.yM1su.MnZDTZiGQpMcG3",
+			"ltuid_v2": "110666115",
+			"ltmid_v2": "hg_6fuk18lovy"
 		},
 		{
 			"platform": "skport",

@@ -267,14 +267,43 @@ function Send-DiscordNotification {
 # HoYoLAB
 ####################
 
-function Test-HoyolabCookie {
-	param($CookieString)
-	if ($CookieString -like "*ltoken_v2=*") {
-		return (($CookieString -match 'ltoken_v2=v2_[^\s;]{114,}') -and ($CookieString -match 'ltmid_v2=[0-9a-zA-Z_]{13}') -and ($CookieString -match 'ltuid_v2=(\d+)'))
+function Select-HoyolabCookie {
+	param($Profiie)
+	
+	$jar = @{ 'mi18nLang' = $Profiie.lang }
+	$ltuid = "Unknown"
+	
+	$isV2Valid = ($Profiie.ltoken_v2) -and ($Profiie.ltoken_v2 -match '^v2_[^\s;]{114,}$') -and ($Profiie.ltmid_v2 -match '^[0-9a-zA-Z_]{13}$') -and ($Profiie.ltuid_v2 -match '^\d+$')
+	if ($isV2Valid) {
+		$jar['ltoken_v2'] = $Profiie.ltoken_v2
+		$jar['ltmid_v2'] = $Profiie.ltmid_v2
+		$jar['ltuid_v2'] = $Profiie.ltuid_v2
+		return @{ IsValid = $true; Jar = $jar; ltuid = $Profiie.ltuid_v2 }
 	}
-	else {
-		return (($CookieString -match 'ltoken=[0-9a-zA-Z]{40}') -and ($CookieString -match 'ltuid=(\d+)'))
+	
+	$isV1Valid = ($Profiie.ltoken) -and ($Profiie.ltoken -match '^[0-9a-zA-Z]{40}$') -and ($Profiie.ltuid -match '^\d+$')
+	if ($isV1Valid) {
+		$jar['ltoken'] = $Profiie.ltoken
+		$jar['ltuid'] = $Profiie.ltuid
+		return @{ IsValid = $true; Jar = $jar; ltuid = $Profiie.ltuid }
 	}
+	
+	$CookieString = $Profiie.cookies
+	if ($CookieString) {
+		$isValidFallback = (($CookieString -like "*ltoken_v2=*") -and ($CookieString -match 'ltoken_v2=v2_[^\s;]{114,}') -and ($CookieString -match 'ltmid_v2=[0-9a-zA-Z_]{13}') -and ($CookieString -match 'ltuid_v2=(\d+)')) -or (($CookieString -match 'ltoken=[0-9a-zA-Z]{40}') -and ($CookieString -match 'ltuid=(\d+)'))
+		if ($isValidFallback) {
+			foreach ($c in ($CookieString -split ';')) {
+				$c = $c.Trim()
+				if ($c) {
+					$c_pair = $c -split '=', 2
+					$jar[$c_pair[0]] = $c_pair[1]
+				}
+			}
+			if ($CookieString -match 'ltuid(_v2)?=(\d+)') { $ltuid = $Matches[2] }
+			return @{ IsValid = $true; Jar = $jar; ltuid = $ltuid }
+		}
+	}
+	return @{ IsValid = $false }
 }
 
 function Get-HoyolabAccountInfo {
@@ -311,26 +340,19 @@ function Get-HoyolabAccountInfo {
 function Invoke-HoyolabCheckin {
 	param($Profiie, $Config, $Embed, $IsReusing)
 
-	$Cookie = $Profiie.cookies
-	if (-not (Test-HoyolabCookie -CookieString $Cookie)) {
-		Out-Log -Level 'ERROR' -Message "Invalid cookie format: $Cookie"
+	$cookieResult = Select-HoyolabCookie -Profiie $Profiie
+	if (-not $cookieResult.IsValid) {
+		$logMsg = if ($Profiie.console_name) { $Profiie.console_name } else { "Unknown" }
+		Out-Log -Level 'ERROR' -Message "Invalid cookie format for profile: $logMsg"
 		return @{ NeedPing = $true }
 	}
 
-	$ltuid = if ($Cookie -match 'ltuid(_v2)?=(\d+)') { $Matches[2] } else { "Unknown" }
+	$jar = $cookieResult.Jar
+	$ltuid = $cookieResult.ltuid
+
 	$display_name = $ltuid -replace '^(\d{2})\d+(\d{2})$', '$1****$2'
 	$Embed.title = $display_name -replace '\*', '\*'
 	if ($ltuid -ne "Unknown") { $Embed.description = "ID: ||$ltuid||" }
-
-	# Parse cookies into jar
-	$jar = @{}
-	foreach ($c in ($Cookie -split ';')) {
-		$c = $c.Trim()
-		if ($c) {
-			$c_pair = $c -split '=', 2
-			$jar[$c_pair[0]] = $c_pair[1]
-		}
-	}
 
 	# Get detailed account info
 	$ac_info = Get-HoyolabAccountInfo -Cookies $jar -Config $Config
