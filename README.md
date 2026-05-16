@@ -2,13 +2,14 @@
 
 > English | [繁體中文](README_ZH.md)
 
-An auto attendance tool written in PowerShell, for official gaming social platforms like HoYoLAB and Skport.
+An auto attendance tool written in PowerShell, for official gaming social platforms like HoYoLAB, Skport, and Skland.
 
 ## Features
 
 - **Multi-platform Support**:
     - **HoYoLAB**: Supports attendance for *Genshin Impact*, *Honkai: Star Rail*, *Zenless Zone Zero*, etc.
     - **Skport**: Supports attendance for *Arknights: Endfield*.
+    - **Skland**: Supports attendance for *Arknights* and *Arknights: Endfield*.
 - **Discord Notifications**:
     - **Message Reuse**: Intelligently updates the same Discord message to avoid notification clutter.
     - **Minimal Mode**: Option to display detailed reward info or a concise one-line summary.
@@ -30,7 +31,8 @@ Clone or download this repository to your local directory.
 1. Rename or save `sign.example.json` as `sign.json`.
 2. Fill in the credentials as needed:
    - **HoYoLAB**: Log in to the [HoYoLAB Official Site](https://www.hoyolab.com/), open browser developer tools, and get `ltoken_v2`, `ltmid_v2`, and `ltuid_v2` from cookies.
-   - **Skport**: Refer to the [How to Get Skport Credentials](#how-to-get-skport-credentials) section below.
+   - **Skport**: Refer to the [How to Get Skport Credentials](#how-to-get-skport-credentials) section below (`profiles[].cred`).
+   - **Skland**: See [How to Get Skland Token](#how-to-get-skland-token), then put it in `profiles[].token`.
 3. Configure **Discord Webhook**:
    - Enter your Webhook URL in `display.discord.bots` (leave blank if not needed).
    - To enable message updating, set `reuse_msg` to `true`.
@@ -40,6 +42,11 @@ Clone or download this repository to your local directory.
 2. Go to the [Script Link](https://github.com/cptmacp/blobs/raw/refs/heads/main/fetch_cred_user.js) and install/import it.
 3. Open the [Endfield Sign-in Page](https://game.skport.com/endfield/sign-in?header=0&hg_media=skport&hg_link_campaign=tools) and wait a moment.
 4. A window containing `cred` will pop up; copy it into `sign.json`.
+
+#### How to Get Skland Token
+1. After logging in to [Skland Web](https://www.skland.com/), open `https://web-api.skland.com/account/info/hg` and copy the `content` field value.
+2. Or log in to [Hypergryph Passport](https://user.hypergryph.com/login), open `https://web-api.hypergryph.com/account/info/hg`, and copy the `content` field value (recommended).
+3. In this project, put the token into `profiles[].token` for the `platform: "skland"` profile.
 
 ### 4. Run the Script
 Open PowerShell, navigate to the project directory, and execute:
@@ -59,9 +66,27 @@ Open PowerShell, navigate to the project directory, and execute:
 - `profiles`: A list where you can enter account indices (starting from `0`) or specific `console_name` values.
 
 ### Account Configuration (`profiles`)
-- `platform`: `hoyolab` or `skport`.
-- `cookies`/`cred`: Credentials for the corresponding platform.
+- `platform`: `hoyolab`, `skport`, or `skland`.
+- HoYoLAB credentials: `ltoken`/`ltoken_v2` and related cookie fields.
+- Skport credentials: `cred` is required.
+- Skland credentials: `token` is required.
 - `console_name`: A custom name used for log display and bot matching.
+
+### SK v2 Configuration (Breaking Change)
+- SK providers (`skport`, `skland`) are now **v2-only** at runtime.
+- No legacy key compatibility adapter is kept for SK config.
+- `platforms.<provider>.lang` is required.
+- `platforms.<provider>.games[]` requires all of:
+  - `name`
+  - `app_code`
+  - `api_base`
+  - `origin_url`
+  - `referer_url`
+  - `platform`
+  - `vName`
+- Runtime behavior uses one shared SK core pipeline for both providers.
+- Reward output is deterministic named-only; unresolved reward names are shown as:
+  - `Reward detail unavailable from provider API.`
 
 ## Automation
 
