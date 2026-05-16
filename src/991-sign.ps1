@@ -11,6 +11,24 @@ function Invoke-AnimeAttendance {
 		[string]$ConfigPath = ".\sign.json"
 	)
 
+	function Test-SkV2Config {
+		param($Profile, $PlatformConfig, [string]$PlatformName)
+		$errors = @()
+		if (-not $Profile) { $errors += "Missing profile"; return $errors }
+		if (-not $PlatformConfig) { $errors += "Missing platforms.$PlatformName config"; return $errors }
+		if (-not $PlatformConfig.lang) { $errors += "platforms.$PlatformName.lang is required" }
+		if (-not $PlatformConfig.user_agent) { $errors += "platforms.$PlatformName.user_agent is required" }
+		if (-not $PlatformConfig.games -or $PlatformConfig.games.Count -eq 0) { $errors += "platforms.$PlatformName.games must be a non-empty array" }
+		foreach ($game in @($PlatformConfig.games)) {
+			foreach ($key in @('name', 'app_code', 'api_base', 'origin_url', 'referer_url', 'platform', 'vName')) {
+				if (-not $game.$key) { $errors += "platforms.$PlatformName.games[].$key is required" }
+			}
+		}
+		if ($PlatformName -eq 'skport' -and -not $Profile.cred) { $errors += "profiles[].cred is required for skport" }
+		if ($PlatformName -eq 'skland' -and -not $Profile.token) { $errors += "profiles[].token is required for skland" }
+		return $errors
+	}
+
 	function Test-DiscordBotProfileMatch {
 		param(
 			$BotConfig,
@@ -63,6 +81,26 @@ function Invoke-AnimeAttendance {
 		$platform = $profiie.platform
 		$p_conf = $conf.platforms.$platform
 		$embed = Initialize-DiscordEmbed
+		if ($platform -in @('skport', 'skland')) {
+			$v2Errors = Test-SkV2Config -Profile $profiie -PlatformConfig $p_conf -PlatformName $platform
+			if ($v2Errors.Count -gt 0) {
+				$msg = ($v2Errors -join '; ')
+				Out-Log -Level 'ERROR' -Message "Invalid SK v2 config for profile index ${profile_idx}: $msg"
+				$embed.title = "Invalid SK v2 config"
+				$embed.description = "Profile index: $profile_idx"
+				$embed.fields += @{ 'name' = $platform; 'value' = $msg; 'inline' = $false }
+				$result = @{ NeedPing = $true }
+				foreach ($bot_name in $bot_results.Keys) {
+					$bot_data = $bot_results[$bot_name]
+					$bot_config = $bot_data.BotConfig
+					if (Test-DiscordBotProfileMatch -BotConfig $bot_config -Profile $profiie -ProfileIndex $profile_idx) {
+						$bot_data.Embeds += $embed
+						$bot_data.AnyNeedPing = $true
+					}
+				}
+				continue
+			}
+		}
 
 		$is_reusing = $false
 		foreach ($bot_name in $bot_results.Keys) {
