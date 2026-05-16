@@ -519,11 +519,12 @@ function Invoke-SkAttendanceCore {
 
 		$awardLines = Resolve-SkAwardLines -Data $data -Ctx $roleCtx
 		$awardText = $awardLines -join "`n"
+		$awardLogText = $awardLines -join ", "
 		if ($isAlready) {
-			Out-Log -Level 'INFO' -Message "[$($ident.identity)] Already checked in. Awards: $awardText"
+			Out-Log -Level 'INFO' -Message "[$($ident.identity)] Already checked in. Awards: $awardLogText"
 		}
 		else {
-			Out-Log -Level 'INFO' -Message "[$($ident.identity)] Check-in success! Awards: $awardText"
+			Out-Log -Level 'INFO' -Message "[$($ident.identity)] Check-in success! Awards: $awardLogText"
 		}
 		if (-not $IsReusing -or -not $isAlready) {
 			$Embed.fields += @{ 'name' = $ident.title; 'value' = "*$($ident.server_name)* - $($ident.nickname)`n$awardText"; 'inline' = $true; 'key' = $fieldKey }
