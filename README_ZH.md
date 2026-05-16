@@ -44,8 +44,8 @@
 4. 頁面會彈出包含 `cred` 的視窗，將其複製到 `sign.json` 即可。
 
 #### 如何獲取 Skland Token
-1. 登錄 [鹰角网络通行证](https://user.hypergryph.com/login) 後，打開 `https://web-api.hypergryph.com/account/info/hg`，記下 `content` 字段的值。
-2. 或者登錄 [森空島网页版](https://www.skland.com/) 後，打開 `https://web-api.skland.com/account/info/hg`，記下 `content` 字段的值。
+1. 登錄 [鹰角网络通行证](https://user.hypergryph.com/login) 後，打開 `https://web-api.hypergryph.com/account/info/hg`，記下 `content` 字段的憑據值。
+2. 或者登錄 [森空島网页版](https://www.skland.com/) 後，打開 `https://web-api.skland.com/account/info/hg`，記下 `content` 字段的憑據值。
 3. 在本專案中，將憑據填入 `profiles[].token`（`platform: "skland"` 對應的 profile）。
 
 ### 4. 運行腳本

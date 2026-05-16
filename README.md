@@ -44,8 +44,8 @@ Clone or download this repository to your local directory.
 4. A window containing `cred` will pop up; copy it into `sign.json`.
 
 #### How to Get Skland Token
-1. After logging in to [Skland Web](https://www.skland.com/), open `https://web-api.skland.com/account/info/hg` and copy the `content` field value.
-2. Or log in to [Hypergryph Passport](https://user.hypergryph.com/login), open `https://web-api.hypergryph.com/account/info/hg`, and copy the `content` field value (recommended).
+1. Log in to [Hypergryph Passport](https://user.hypergryph.com/login), open `https://web-api.hypergryph.com/account/info/hg`, and copy the `content` field value as token.
+2. Or log in to [Skland Web](https://www.skland.com/), open `https://web-api.skland.com/account/info/hg` and copy the `content` field value as token.
 3. In this project, put the token into `profiles[].token` for the `platform: "skland"` profile.
 
 ### 4. Run the Script
