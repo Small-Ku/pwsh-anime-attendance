@@ -4,21 +4,7 @@
 
 function Get-SkportSignature {
 	param($Path, $Body, $Timestamp, $Token, $Platform, $VName)
-
-	$s = $Path + $Body + $Timestamp
-	$s += '{"platform":"' + $Platform + '","timestamp":"' + $Timestamp + '","dId":"","vName":"' + $VName + '"}'
-	Out-Log -Level 'DEBUG' -Message "Skport Signature Raw String: $s"
-
-	$hmac = [System.Security.Cryptography.HMACSHA256]::new([System.Text.Encoding]::UTF8.GetBytes($Token))
-	$hmacBytes = $hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s))
-	$hmacHex = [System.BitConverter]::ToString($hmacBytes).Replace('-', '').ToLower()
-
-	$md5 = [System.Security.Cryptography.MD5]::Create()
-	$md5Bytes = $md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($hmacHex))
-	$res = [System.BitConverter]::ToString($md5Bytes).Replace('-', '').ToLower()
-
-	Out-Log -Level 'DEBUG' -Message "Skport Signature: $res"
-	return $res
+	return Get-SkSignature -Path $Path -Body $Body -Timestamp $Timestamp -Token $Token -Platform $Platform -VName $VName -DId ""
 }
 
 function Invoke-SkportRequest {
@@ -64,23 +50,7 @@ function Invoke-SkportRequest {
 		return $ret
 	}
 	catch {
-		$statusCode = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode } else { 0 }
-		$code = if ($statusCode -gt 0) { - $statusCode } else { -1 }
-		$msg = if ($_.Exception.Message) { $_.Exception.Message } else { "Request Failed" }
-		
-		if ($_.Exception.Response) {
-			try {
-				$reader = [System.IO.StreamReader]::new($_.Exception.Response.GetResponseStream())
-				$respBody = $reader.ReadToEnd()
-				if ($respBody) {
-					$json = $respBody | ConvertFrom-Json
-					if ($null -ne $json.code) { return $json }
-					if ($json.message) { $msg = $json.message }
-				}
-			}
-			catch {}
-		}
-		return @{ code = $code; message = $msg }
+		return ConvertFrom-SkRequestError -ErrorRecord $_
 	}
 }
 

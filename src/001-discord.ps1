@@ -64,8 +64,11 @@ function Send-DiscordNotification {
 			# Create a field map for fast lookups/updates
 			$field_map = [ordered]@{}
 			if ($ex_embed.fields) {
+				$idx = 0
 				foreach ($f in $ex_embed.fields) {
-					$field_map[$f.name] = $f
+					$idx += 1
+					$key = if ($f.key) { [string]$f.key } else { "$($f.name)#$idx" }
+					$field_map[$key] = $f
 				}
 			}
 
@@ -141,6 +144,7 @@ function Send-DiscordNotification {
 		foreach ($new_f in $new_e.fields) {
 			# Determine value based on minimal flag
 			$val = if ($BotConfig.minimal -and $new_f.minimal) { $new_f.minimal } else { $new_f.value }
+			$fieldKey = if ($new_f.key) { [string]$new_f.key } else { [string]$new_f.name }
 			
 			$clean_field = @{
 				'name'   = $new_f.name
@@ -148,8 +152,29 @@ function Send-DiscordNotification {
 				'inline' = $new_f.inline
 			}
 
+			# When existing embeds came from Discord payload, custom `key` is absent.
+			# Fallback-match by (name + first value line) to keep updates stable.
+			if (-not $target_field_map.Contains($fieldKey) -and $new_f.key) {
+				$newFirstLine = ""
+				if ($val) {
+					$newFirstLine = ([string]$val -split "`r?`n")[0]
+				}
+				foreach ($existingKey in @($target_field_map.Keys)) {
+					$existingField = $target_field_map[$existingKey]
+					if ($existingField.name -ne $new_f.name) { continue }
+					$existingFirstLine = ""
+					if ($existingField.value) {
+						$existingFirstLine = ([string]$existingField.value -split "`r?`n")[0]
+					}
+					if ($existingFirstLine -eq $newFirstLine) {
+						$fieldKey = $existingKey
+						break
+					}
+				}
+			}
+
 			# Update/Add
-			$target_field_map[$new_f.name] = $clean_field
+			$target_field_map[$fieldKey] = $clean_field
 		}
 	}
 

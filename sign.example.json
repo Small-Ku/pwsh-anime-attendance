@@ -47,6 +47,11 @@
 			"platform": "skport",
 			"console_name": "ENDOMIN",
 			"cred": "9LfD2Tun65kpld4qlvDfDU91v0u0C3tk"
+		},
+		{
+			"platform": "skland",
+			"console_name": "DOKUTAH",
+			"token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.EXAMPLE_HYPERGRYPH_OAUTH_TOKEN"
 		}
 	],
 	"platforms": {
@@ -109,6 +114,30 @@
 					"app_code": "endfield",
 					"platform": "3",
 					"vName": "1.0.0"
+				}
+			]
+		},
+		"skland": {
+			"lang": "zh_CN",
+			"user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0",
+			"games": [
+				{
+					"name": "Arknights: Endfield (Skland)",
+					"api_base": "https://zonai.skland.com",
+					"origin_url": "https://game.skland.com",
+					"referer_url": "https://game.skland.com/",
+					"app_code": "endfield",
+					"platform": "1",
+					"vName": "1.21.0"
+				},
+				{
+					"name": "Arknights",
+					"api_base": "https://zonai.skland.com",
+					"origin_url": "https://www.skland.com",
+					"referer_url": "https://www.skland.com/",
+					"app_code": "arknights",
+					"platform": "1",
+					"vName": "1.21.0"
 				}
 			]
 		}
