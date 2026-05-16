@@ -9,6 +9,30 @@
 
 $ErrorActionPreference = "Stop"
 
+function Test-PowerShellSyntax {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $content = [System.IO.File]::ReadAllText($Path)
+    $errors = $null
+    $tokens = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($content, [ref]$tokens, [ref]$errors)
+
+    if ($errors -and $errors.Count -gt 0) {
+        Write-Host "❌ Syntax check failed: $Path" -ForegroundColor Red
+        Write-Host "Found $($errors.Count) error(s)" -ForegroundColor Red
+        foreach ($err in $errors) {
+            Write-Host "Error: $($err.Message) at line $($err.Extent.StartLineNumber) col $($err.Extent.StartColumnNumber)" -ForegroundColor Yellow
+            Write-Host "Line text: $($err.Extent.Text)" -ForegroundColor DarkYellow
+        }
+        exit 1
+    }
+
+    Write-Host "✅ Syntax OK: $Path" -ForegroundColor DarkGreen
+}
+
 # Module name
 $moduleName = "AnimeAttendance"
 $outputPath = Join-Path $PSScriptRoot $moduleName
@@ -43,6 +67,7 @@ if (!$srcFiles) {
 
 foreach ($file in $srcFiles) {
     Write-Host "📄 Merging: $($file.Name)" -ForegroundColor Gray
+    Test-PowerShellSyntax -Path $file.FullName
     $content = Get-Content $file.FullName -Raw -Encoding utf8
 
     # --- Extract Exports first ---
@@ -68,6 +93,7 @@ foreach ($file in $srcFiles) {
 # Write .psm1 as UTF-16 LE for maximum Windows PowerShell parser compatibility
 $psm1Content | Out-File $psm1Path -Encoding unicode
 Write-Host "✅ Generated $psm1Path" -ForegroundColor Green
+Test-PowerShellSyntax -Path $psm1Path
 
 # Copy non-ps1 resources
 Get-ChildItem -Path $srcPath | Where-Object { $_.Extension -ne ".ps1" } | ForEach-Object {
