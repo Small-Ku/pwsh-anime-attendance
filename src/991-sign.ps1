@@ -115,6 +115,7 @@ function Invoke-AnimeAttendance {
 
 		$result = switch ($platform) {
 			'hoyolab' { Invoke-HoyolabCheckin -Profiie $profiie -Config $p_conf -Embed $embed -IsReusing $is_reusing }
+			'fuhouse' { Invoke-FuhouseAttendance -Profiie $profiie -Config $p_conf -Embed $embed -IsReusing $is_reusing }
 			'skport' { Invoke-SkportAttendance -Profiie $profiie -Config $p_conf -Embed $embed -IsReusing $is_reusing }
 			'skland' { Invoke-SklandAttendance -Profiie $profiie -Config $p_conf -Embed $embed -IsReusing $is_reusing }
 			Default { Out-Log -Level 'ERROR' -Message "Unknown platform: $platform"; continue }

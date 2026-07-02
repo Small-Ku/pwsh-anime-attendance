@@ -52,6 +52,11 @@
 			"platform": "skland",
 			"console_name": "DOKUTAH",
 			"token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.EXAMPLE_HYPERGRYPH_OAUTH_TOKEN"
+		},
+		{
+			"platform": "fuhouse",
+			"console_name": "FUJOSHI",
+			"cookies": "PHPSESSID=abcdef0123456789abcdef0123456789; lang=CN; dark=N; shunt=3"
 		}
 	],
 	"platforms": {
@@ -140,6 +145,24 @@
 					"vName": "1.21.0"
 				}
 			]
+		},
+		"fuhouse": {
+			"base_url": "https://boylove.cc",
+			"user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+			"discord_text": {
+				"missing_cookie": "Missing or invalid cookies (PHPSESSID required)",
+				"connection_error": "Connection error occurred",
+				"failed_fetch_page": "Failed to fetch user page: {0}",
+				"session_expired": "Session expired, please update cookies.",
+				"daily_sign_in": "Daily Sign-In",
+				"sign_in_failed": "Sign-in failed (code: {0})",
+				"connection_failed": "Connection failed: {0}",
+				"ads_task": "Ads Task",
+				"ads_task_claim_failed": "Claim failed (code: {0})",
+				"reading_task": "Reading Task",
+				"no_available_chapters": "No chapters available to read",
+				"reading_task_claim_failed": "Claim failed (code: {0})"
+			}
 		}
 	}
 }

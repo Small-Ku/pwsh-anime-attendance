@@ -2,7 +2,7 @@
 
 > [English](README.md) | 繁體中文
 
-使用 PowerShell 編寫的多功能遊戲自動簽到工具，支持 HoYoLAB、Skport、Skland 等遊戲官方社群平台。
+使用 PowerShell 編寫的自動簽到工具，支持 HoYoLAB、Skport、Skland 等線上平台。
 
 ## 功能特性
 
@@ -66,27 +66,12 @@
 - `profiles`: 列表形式，可填入帳號索引 (以 `0` 開始) 或特定帳號的 `console_name`。
 
 ### 帳號配置 (`profiles`)
-- `platform`: `hoyolab`、`skport` 或 `skland`。
+- `platform`: `hoyolab`、`skport`、`skland` 或 `fuhouse`。
 - HoYoLAB 憑證：`ltoken`/`ltoken_v2` 與相關 Cookie 欄位。
 - Skport 憑證：必填 `cred`。
 - Skland 憑證：必填 `token`。
+- Fuhouse 憑證：必填 `cookies`（特別是 `PHPSESSID` cookie 欄位）。
 - `console_name`: 用於日誌顯示及機器人匹配的自定義名稱。
-
-### SK v2 配置（破壞性變更）
-- SK 平台（`skport`、`skland`）執行時僅支援 **v2 配置**。
-- 不再保留舊版 SK 配置鍵名的相容轉換。
-- 必填 `platforms.<provider>.lang`。
-- `platforms.<provider>.games[]` 必填欄位：
-  - `name`
-  - `app_code`
-  - `api_base`
-  - `origin_url`
-  - `referer_url`
-  - `platform`
-  - `vName`
-- 執行流程採用一套共享 SK Core 管線（Skport / Skland 共用）。
-- 獎勵輸出固定為名稱模式；若無法解析名稱，顯示：
-  - `Reward detail unavailable from provider API.`
 
 ## 自動化運行
 

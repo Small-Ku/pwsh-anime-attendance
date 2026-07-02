@@ -2,7 +2,7 @@
 
 > English | [繁體中文](README_ZH.md)
 
-An auto attendance tool written in PowerShell, for official gaming social platforms like HoYoLAB, Skport, and Skland.
+An auto attendance tool written in PowerShell, for online platforms like HoYoLAB, Skport, and Skland.
 
 ## Features
 
@@ -66,27 +66,12 @@ Open PowerShell, navigate to the project directory, and execute:
 - `profiles`: A list where you can enter account indices (starting from `0`) or specific `console_name` values.
 
 ### Account Configuration (`profiles`)
-- `platform`: `hoyolab`, `skport`, or `skland`.
+- `platform`: `hoyolab`, `skport`, `skland`, or `fuhouse`.
 - HoYoLAB credentials: `ltoken`/`ltoken_v2` and related cookie fields.
 - Skport credentials: `cred` is required.
 - Skland credentials: `token` is required.
+- Fuhouse credentials: `cookies` (specifically `PHPSESSID` cookie) is required.
 - `console_name`: A custom name used for log display and bot matching.
-
-### SK v2 Configuration (Breaking Change)
-- SK providers (`skport`, `skland`) are now **v2-only** at runtime.
-- No legacy key compatibility adapter is kept for SK config.
-- `platforms.<provider>.lang` is required.
-- `platforms.<provider>.games[]` requires all of:
-  - `name`
-  - `app_code`
-  - `api_base`
-  - `origin_url`
-  - `referer_url`
-  - `platform`
-  - `vName`
-- Runtime behavior uses one shared SK core pipeline for both providers.
-- Reward output is deterministic named-only; unresolved reward names are shown as:
-  - `Reward detail unavailable from provider API.`
 
 ## Automation
 
