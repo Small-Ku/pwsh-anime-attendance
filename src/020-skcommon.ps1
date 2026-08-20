@@ -92,10 +92,6 @@ function ConvertFrom-SkRequestError {
 	return @{ code = $code; message = $msg }
 }
 
-function New-SklandDid {
-	return "B$([guid]::NewGuid().ToString('N'))"
-}
-
 if (-not $script:SkEndfieldResourceNameMapByLang) {
 	$script:SkEndfieldResourceNameMapByLang = @{}
 }
@@ -178,8 +174,17 @@ function Get-SkProviderProfile {
 		'skland' {
 			return @{
 				name = 'skland'
-				passport = @{ base_url = 'https://as.hypergryph.com'; grant = '/user/oauth2/v2/grant' }
-				auth = @{ mode = 'passport_oauth'; appCode = '4ca99fa6b56cc2ba'; grantType = 0; kind = 1; credPath = '/web/v1/user/auth/generate_cred_by_code' }
+				passport = @{
+					base_url = 'https://as.hypergryph.com'; grant = '/user/oauth2/v2/grant'
+					user_agent = 'Mozilla/5.0 (Linux; Android 12; SM-A5560 Build/V417IR; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/101.0.4951.61 Safari/537.36 SKLand/1.52.1'
+					x_requested_with = 'com.hypergryph.skland'
+				}
+				auth = @{
+					mode = 'passport_oauth'; appCode = '4ca99fa6b56cc2ba'; grantType = 0; kind = 1; credPath = '/web/v1/user/auth/generate_cred_by_code'
+					platform = '3'; vName = '1.0.0'; origin = 'https://www.skland.com'; referer = 'https://www.skland.com/'
+					user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
+				}
+				signature = @{ platform = '3'; vName = '1.0.0' }
 				paths = @{
 					refresh = '/web/v1/auth/refresh'; user = '/web/v1/user'; binding = '/api/v1/game/player/binding'
 					attendance = @{
@@ -205,10 +210,31 @@ function Get-SkValueByPath {
 	return $curr
 }
 
+function Resolve-SkPassportToken {
+	param($Token)
+	if ($null -eq $Token) { return $null }
+
+	$tokenText = ([string]$Token).Trim()
+	if ([string]::IsNullOrWhiteSpace($tokenText)) { return $tokenText }
+	try {
+		$parsed = $tokenText | ConvertFrom-Json -ErrorAction 'Stop'
+		if ($parsed.data -and $parsed.data.content -is [string]) { return $parsed.data.content }
+	}
+	catch { $parsed = $null }
+	return $tokenText
+}
+
 function Invoke-SkPassportRequest {
 	param($Method, [string]$Path, $Body, $Ctx)
+
 	$uri = "$($Ctx.ProviderProfile.passport.base_url)$Path"
-	$params = @{ Method = $Method; Uri = $uri; Headers = @{ 'Content-Type' = 'application/json' }; UserAgent = $Ctx.PlatformConfig.user_agent; ContentType = 'application/json'; ErrorAction = 'Stop' }
+	$headers = @{ 'Content-Type' = 'application/json' }
+	$userAgent = $Ctx.PlatformConfig.user_agent
+	if ($Ctx.ProviderProfile.passport.user_agent) { $userAgent = $Ctx.ProviderProfile.passport.user_agent }
+	if ($Ctx.DId) { $headers['dId'] = $Ctx.DId }
+	if ($Ctx.ProviderProfile.passport.x_requested_with) { $headers['x-requested-with'] = $Ctx.ProviderProfile.passport.x_requested_with }
+
+	$params = @{ Method = $Method; Uri = $uri; Headers = $headers; UserAgent = $userAgent; ContentType = 'application/json'; ErrorAction = 'Stop' }
 	if ($null -ne $Body -and $Body -ne '') { $params.Body = ConvertTo-SkCompactJson -Value $Body }
 	try {
 		$ret = Invoke-RestMethod @params
@@ -233,23 +259,46 @@ function Invoke-SkApiRequest {
 	$uri = "$($Ctx.GameConfig.api_base)$Path"
 	if ($queryString) { $uri += "?$queryString" }
 
+	$platform = $Ctx.GameConfig.platform
+	$vName = $Ctx.GameConfig.vName
+	if ($Ctx.ProviderProfile.signature) {
+		if ($Ctx.ProviderProfile.signature.platform) { $platform = $Ctx.ProviderProfile.signature.platform }
+		if ($Ctx.ProviderProfile.signature.vName) { $vName = $Ctx.ProviderProfile.signature.vName }
+	}
+
+	$referer = $Ctx.GameConfig.referer_url
+	$origin = $Ctx.GameConfig.origin_url
+	$userAgent = $Ctx.PlatformConfig.user_agent
+	$isAuthWebRequest = $false
+	if ($Ctx.ProviderProfile.auth -and $Ctx.ProviderProfile.auth.user_agent) {
+		$isAuthWebRequest = ($Path -eq $Ctx.ProviderProfile.auth.credPath) -or ($Path -eq $Ctx.ProviderProfile.paths.refresh)
+	}
+	if ($isAuthWebRequest) {
+		$platform = $Ctx.ProviderProfile.auth.platform
+		$vName = $Ctx.ProviderProfile.auth.vName
+		$referer = $Ctx.ProviderProfile.auth.referer
+		$origin = $Ctx.ProviderProfile.auth.origin
+		$userAgent = $Ctx.ProviderProfile.auth.user_agent
+	}
+
 	$currTs = ([DateTimeOffset]::Now.ToUnixTimeSeconds() + $Ctx.TimeOffset).ToString()
 	$bodyText = ConvertTo-SkCompactJson -Value $Body
 	$headers = @{
-		'Accept' = '*/*'; 'Accept-Language' = 'en-US,en;q=0.9'; 'Referer' = $Ctx.GameConfig.referer_url
+		'Accept' = '*/*'; 'Accept-Language' = 'en-US,en;q=0.9'; 'Referer' = $referer
 		'Content-Type' = 'application/json'; 'sk-language' = $Ctx.PlatformConfig.lang
-		'platform' = $Ctx.GameConfig.platform; 'vName' = $Ctx.GameConfig.vName
-		'timestamp' = $currTs; 'Origin' = $Ctx.GameConfig.origin_url
+		'platform' = $platform; 'vName' = $vName
+		'timestamp' = $currTs; 'Origin' = $origin
 		'Sec-Fetch-Dest' = 'empty'; 'Sec-Fetch-Mode' = 'cors'; 'Sec-Fetch-Site' = 'same-site'
 	}
 	if ($Ctx.DId) { $headers['dId'] = $Ctx.DId }
 	if ($Ctx.Cred) { $headers['cred'] = $Ctx.Cred }
 	if ($Ctx.SkGameRole) { $headers['sk-game-role'] = $Ctx.SkGameRole }
+	if ($Ctx.ProviderProfile.passport.x_requested_with -and $Path -ne $Ctx.ProviderProfile.auth.credPath) { $headers['x-requested-with'] = $Ctx.ProviderProfile.passport.x_requested_with }
 	if ($Ctx.Token -and $Path) {
-		$headers['sign'] = Get-SkSignature -Path $Path -QueryString $queryString -Body $bodyText -Timestamp $currTs -Token $Ctx.Token -Platform $Ctx.GameConfig.platform -VName $Ctx.GameConfig.vName -DId $Ctx.DId
+		$headers['sign'] = Get-SkSignature -Path $Path -QueryString $queryString -Body $bodyText -Timestamp $currTs -Token $Ctx.Token -Platform $platform -VName $vName -DId $Ctx.DId
 	}
 
-	$params = @{ Method = $Method; Uri = $uri; Headers = $headers; UserAgent = $Ctx.PlatformConfig.user_agent; ContentType = 'application/json'; ErrorAction = 'Stop' }
+	$params = @{ Method = $Method; Uri = $uri; Headers = $headers; UserAgent = $userAgent; ContentType = 'application/json'; ErrorAction = 'Stop' }
 	if ($Method -ne 'Get' -or ($bodyText -ne '')) { $params.Body = $bodyText }
 
 	try {
@@ -274,10 +323,11 @@ function Initialize-SkAuthState {
 		return $true
 	}
 
-	$grantBody = @{ appCode = $Ctx.ProviderProfile.auth.appCode; token = $Ctx.Profile.token; type = $Ctx.ProviderProfile.auth.grantType }
+	$grantBody = @{ appCode = $Ctx.ProviderProfile.auth.appCode; token = Resolve-SkPassportToken -Token $Ctx.Profile.token; type = $Ctx.ProviderProfile.auth.grantType }
 	$grant = Invoke-SkPassportRequest -Method 'Post' -Path $Ctx.ProviderProfile.passport.grant -Body $grantBody -Ctx $Ctx
 	if ($grant.status -ne 0 -or -not $grant.data.code) {
-		Out-Log -Level 'WARN' -Message "$($Ctx.ProviderProfile.name) grant authorize code failed: $($grant.msg)"
+		$errMsg = if ($grant.msg) { $grant.msg } elseif ($grant.message) { $grant.message } else { 'Unknown error' }
+		Out-Log -Level 'WARN' -Message "$($Ctx.ProviderProfile.name) grant authorize code failed: $errMsg"
 		return $false
 	}
 	$authBody = @{ code = $grant.data.code; kind = $Ctx.ProviderProfile.auth.kind }
@@ -461,7 +511,16 @@ function Invoke-SkAttendanceCore {
 	}
 
 	$providerProfile = Get-SkProviderProfile -Provider $Provider
-	$ctx = @{ Profile = $Profile; ProviderProfile = $providerProfile; PlatformConfig = $PlatformConfig; GameConfig = $PlatformConfig.games[0]; Cred = $Profile.cred; Token = $null; TimeOffset = 0; DId = if ($Provider -eq 'skland') { New-SklandDid } else { '' }; SkGameRole = $null }
+	$did = ''
+	if ($Provider -eq 'skland') {
+		try { $did = Get-SklandDid }
+		catch {
+			Out-Log -Level 'WARN' -Message $_.Exception.Message
+			$Embed.fields += @{ 'name' = 'Skland'; 'value' = 'Failed to register device'; 'inline' = $true }
+			return @{ NeedPing = $true }
+		}
+	}
+	$ctx = @{ Profile = $Profile; ProviderProfile = $providerProfile; PlatformConfig = $PlatformConfig; GameConfig = $PlatformConfig.games[0]; Cred = $Profile.cred; Token = $null; TimeOffset = 0; DId = $did; SkGameRole = $null }
 	if (-not (Initialize-SkAuthState -Ctx $ctx)) {
 		$Embed.fields += @{ 'name' = ("{0}" -f ($Provider.Substring(0,1).ToUpper() + $Provider.Substring(1))); 'value' = 'Failed to initialize auth state'; 'inline' = $true }
 		return @{ NeedPing = $true }

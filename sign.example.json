@@ -132,8 +132,8 @@
 					"origin_url": "https://game.skland.com",
 					"referer_url": "https://game.skland.com/",
 					"app_code": "endfield",
-					"platform": "1",
-					"vName": "1.21.0"
+					"platform": "3",
+					"vName": "1.0.0"
 				},
 				{
 					"name": "Arknights",
@@ -141,8 +141,8 @@
 					"origin_url": "https://www.skland.com",
 					"referer_url": "https://www.skland.com/",
 					"app_code": "arknights",
-					"platform": "1",
-					"vName": "1.21.0"
+					"platform": "3",
+					"vName": "1.0.0"
 				}
 			]
 		},

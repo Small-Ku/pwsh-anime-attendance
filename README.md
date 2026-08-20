@@ -48,6 +48,8 @@ Clone or download this repository to your local directory.
 2. Or log in to [Skland Web](https://www.skland.com/), open `https://web-api.skland.com/account/info/hg` and copy the `content` field value as token.
 3. In this project, put the token into `profiles[].token` for the `platform: "skland"` profile.
 
+Before exchanging that token for a Skland credential, the script follows the `skland-kit` flow and registers a synthetic device profile with Shumei (`fp-it.portal101.cn`). The validated `dId` returned by that service is required by current Skland device checks.
+
 ### 4. Run the Script
 Open PowerShell, navigate to the project directory, and execute:
 ```powershell

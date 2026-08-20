@@ -48,6 +48,8 @@
 2. 或者登錄 [森空島网页版](https://www.skland.com/) 後，打開 `https://web-api.skland.com/account/info/hg`，記下 `content` 字段的憑據值。
 3. 在本專案中，將憑據填入 `profiles[].token`（`platform: "skland"` 對應的 profile）。
 
+在以該 Token 兌換森空島憑證前，腳本會依照 `skland-kit` 的流程向數美裝置指紋服務（`fp-it.portal101.cn`）註冊一份合成裝置資料，並使用服務回傳的有效 `dId`；目前森空島的裝置校驗需要這一步。
+
 ### 4. 運行腳本
 打開 PowerShell 並切換到專案目錄，執行：
 ```powershell
