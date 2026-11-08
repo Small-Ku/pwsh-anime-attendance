@@ -107,9 +107,10 @@ function Invoke-FuhouseAttendance {
 		Out-Log -Level 'ERROR' -Message "Invalid cookie format for Fuhouse profile: $logMsg"
 		$Embed.title = "Fuhouse: $logMsg"
 		$Embed.fields += @{ 'name' = 'Error'; 'value' = $discordText.missing_cookie; 'inline' = $false }
-		return @{ NeedPing = $true }
+		return New-AttendanceProfileFailure -Platform 'fuhouse' -Reason 'InvalidConfiguration' -Message 'Fuhouse account validation failed'
 	}
 
+	$items = @()
 	$jar = $cookieResult.Jar
 	$userAgent = if ($Config.user_agent) { $Config.user_agent } else { "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36" }
 	$baseUrl = if ($Config.base_url) { $Config.base_url.TrimEnd('/') } else { "https://boylove.cc" }
@@ -135,7 +136,7 @@ function Invoke-FuhouseAttendance {
 		$Embed.title = "Fuhouse: Connection Error"
 		$Embed.description = $discordText.connection_error
 		$Embed.fields += @{ 'name' = 'Error'; 'value' = ($discordText.failed_fetch_page -f $err.Exception.Message); 'inline' = $false }
-		return @{ NeedPing = $true }
+		return New-AttendanceProfileFailure -Platform 'fuhouse' -Reason 'TransportError' -Message 'Fuhouse account validation failed'
 	}
 
 	$displayName = "Unknown"
@@ -158,46 +159,53 @@ function Invoke-FuhouseAttendance {
 		$Embed.title = "Fuhouse: Session Expired"
 		$Embed.description = "Session expired or invalid cookie"
 		$Embed.fields += @{ 'name' = 'Error'; 'value' = $discordText.session_expired; 'inline' = $false }
-		return @{ NeedPing = $true }
+		return New-AttendanceProfileFailure -Platform 'fuhouse' -Reason 'AuthenticationFailed' -Message 'Fuhouse account validation failed'
 	}
 
+	Register-LogSecret -Secret $uid -Label 'uid'
+	Register-GitHubLogMasks
 	$Embed.title = "Fuhouse: $displayName"
 	if ($uid -ne "Unknown") {
 		$Embed.description = "ID: ||$uid||"
 	} else {
 		$Embed.description = ""
 	}
-	$Embed.color = '5635840' # Green (Success)
 	Out-Log -Level 'INFO' -Message "Checking $displayName in for Fuhouse"
 
 	# 2. Perform daily sign-in
 	$signInMsg = ""
-	$needPing = $false
+	$signKind = 'Failed'
 	try {
 		$signInResult = Invoke-FuhouseRequest -Uri "$baseUrl/home/Api/signupNew.html" -Body "td=&auto=true&type=1&autoSign=false" -Headers $headers -UserAgent $userAgent -Session $session
-		Out-Log -Level 'DEBUG' -Message "[$displayName] Sign-in response: $($signInResult | ConvertTo-Json -Depth 10)"
+		Out-Log -Level 'DEBUG' -Message "[$displayName] Sign-in response: $(Format-LogObject -InputObject $signInResult)"
 		
 		if ($signInResult.code -eq 2000 -or $signInResult.code -eq 400) {
+			$signKind = if ($signInResult.code -eq 400) { 'AlreadySigned' } else { 'Signed' }
 			$signInMsg = $signInResult.msg
 			Out-Log -Level 'INFO' -Message "[$displayName] $signInMsg"
 		}
 		else {
 			$signInMsg = if ($signInResult.msg) { $signInResult.msg } else { $discordText.sign_in_failed -f $signInResult.code }
 			Out-Log -Level 'ERROR' -Message "[$displayName] $signInMsg"
-			$needPing = $true
 		}
 	}
 	catch {
 		$err = $_
 		$signInMsg = $discordText.connection_failed -f $err.Exception.Message
 		Out-Log -Level 'ERROR' -Message "[$displayName] Sign-in exception: $($err.Exception.Message)"
-		$needPing = $true
 	}
 
 	$Embed.fields += @{ 'name' = $discordText.daily_sign_in; 'value' = $signInMsg; 'inline' = $true }
+	if ($signKind -eq 'Failed') {
+		$items += New-AttendanceItemResult -Kind 'Failed' -Identity 'Fuhouse sign-in' -Reason 'CheckInUnconfirmed' -Detail 'Daily sign-in failed'
+	}
+	else {
+		$items += New-AttendanceItemResult -Kind $signKind -Identity 'Fuhouse sign-in'
+	}
 
 	# 3. Perform Ads Task (taskid=1)
 	$adsMsg = ""
+	$adsClaimState = 'Failed'
 	Out-Log -Level 'INFO' -Message "[$displayName] Checking $($discordText.ads_task) status..."
 	try {
 		$claimAds = Invoke-FuhouseRequest -Uri "$baseUrl/home/signup/completetask" -Body "taskid=1" -Headers $headers -UserAgent $userAgent -Session $session
@@ -237,9 +245,16 @@ function Invoke-FuhouseAttendance {
 	}
 
 	$Embed.fields += @{ 'name' = $discordText.ads_task; 'value' = $adsMsg; 'inline' = $true }
+	if ($adsClaimState -in @('Claimed', 'AlreadyClaimed')) {
+		$items += New-AttendanceItemResult -Kind 'Signed' -Identity 'Fuhouse ads task'
+	}
+	else {
+		$items += New-AttendanceItemResult -Kind 'Failed' -Identity 'Fuhouse ads task' -Reason 'TaskUnconfirmed' -Detail 'Ads task claim not confirmed'
+	}
 
 	# 4. Perform Reading Task (taskid=2)
 	$readingMsg = ""
+	$readingClaimState = 'Failed'
 	Out-Log -Level 'INFO' -Message "[$displayName] Checking $($discordText.reading_task) status..."
 	try {
 		$claimReading = Invoke-FuhouseRequest -Uri "$baseUrl/home/signup/completetask" -Body "taskid=2" -Headers $headers -UserAgent $userAgent -Session $session
@@ -359,6 +374,12 @@ function Invoke-FuhouseAttendance {
 	}
 
 	$Embed.fields += @{ 'name' = $discordText.reading_task; 'value' = $readingMsg; 'inline' = $true }
+	if ($readingClaimState -in @('Claimed', 'AlreadyClaimed')) {
+		$items += New-AttendanceItemResult -Kind 'Signed' -Identity 'Fuhouse reading task'
+	}
+	else {
+		$items += New-AttendanceItemResult -Kind 'Failed' -Identity 'Fuhouse reading task' -Reason 'TaskUnconfirmed' -Detail 'Reading task claim not confirmed'
+	}
 
-	return @{ NeedPing = $needPing }
+	return Complete-AttendanceProfileResult -Platform 'fuhouse' -Items $items
 }

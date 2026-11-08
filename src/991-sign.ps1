@@ -19,6 +19,9 @@ function Invoke-AnimeAttendance {
 		if (-not $PlatformConfig.lang) { $errors += "platforms.$PlatformName.lang is required" }
 		if (-not $PlatformConfig.user_agent) { $errors += "platforms.$PlatformName.user_agent is required" }
 		if (-not $PlatformConfig.games -or $PlatformConfig.games.Count -eq 0) { $errors += "platforms.$PlatformName.games must be a non-empty array" }
+		if ($PlatformName -eq 'skland' -and $PlatformConfig.device) {
+			$errors += 'platforms.skland.device is not supported; device state is managed per profiles[]'
+		}
 		foreach ($game in @($PlatformConfig.games)) {
 			foreach ($key in @('name', 'app_code', 'api_base', 'origin_url', 'referer_url', 'platform', 'vName')) {
 				if (-not $game.$key) { $errors += "platforms.$PlatformName.games[].$key is required" }
@@ -47,7 +50,11 @@ function Invoke-AnimeAttendance {
 		return $false
 	}
 
-	$script:conf = Get-Content $ConfigPath -Raw -Encoding 'UTF8' | ConvertFrom-Json
+	$resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath -ErrorAction 'Stop').Path
+	$script:AnimeAttendanceConfigPath = $resolvedConfigPath
+	$script:conf = Get-Content -LiteralPath $resolvedConfigPath -Raw -Encoding 'UTF8' | ConvertFrom-Json
+	Normalize-AnimeAttendanceConfig -Config $script:conf | Out-Null
+	Register-LogSecretsFromConfig -Config $script:conf
 	$global:debugging = $env:debug -eq 'pwsh-anime-attendance'
 
 	foreach ($bot in $conf.display.discord.bots) {
@@ -81,24 +88,16 @@ function Invoke-AnimeAttendance {
 		$platform = $profiie.platform
 		$p_conf = $conf.platforms.$platform
 		$embed = Initialize-DiscordEmbed
+		$preflightError = $null
 		if ($platform -in @('skport', 'skland')) {
 			$v2Errors = Test-SkV2Config -Profile $profiie -PlatformConfig $p_conf -PlatformName $platform
 			if ($v2Errors.Count -gt 0) {
 				$msg = ($v2Errors -join '; ')
-				Out-Log -Level 'ERROR' -Message "Invalid SK v2 config for profile index ${profile_idx}: $msg"
-				$embed.title = "Invalid SK v2 config"
+				Out-Log -Level 'ERROR' -Message "Invalid SK v2 config for profile index $($profile_idx): $msg"
+				$embed.title = 'Invalid SK v2 config'
 				$embed.description = "Profile index: $profile_idx"
-				$embed.fields += @{ 'name' = $platform; 'value' = $msg; 'inline' = $false }
-				$result = @{ NeedPing = $true }
-				foreach ($bot_name in $bot_results.Keys) {
-					$bot_data = $bot_results[$bot_name]
-					$bot_config = $bot_data.BotConfig
-					if (Test-DiscordBotProfileMatch -BotConfig $bot_config -Profile $profiie -ProfileIndex $profile_idx) {
-						$bot_data.Embeds += $embed
-						$bot_data.AnyNeedPing = $true
-					}
-				}
-				continue
+				$embed.fields += @{ name = $platform; value = $msg; inline = $false }
+				$preflightError = New-AttendanceProfileFailure -Platform $platform -Reason 'InvalidConfiguration' -Message $msg
 			}
 		}
 
@@ -113,21 +112,47 @@ function Invoke-AnimeAttendance {
 			}
 		}
 
-		$result = switch ($platform) {
-			'hoyolab' { Invoke-HoyolabCheckin -Profiie $profiie -Config $p_conf -Embed $embed -IsReusing $is_reusing }
-			'fuhouse' { Invoke-FuhouseAttendance -Profiie $profiie -Config $p_conf -Embed $embed -IsReusing $is_reusing }
-			'skport' { Invoke-SkportAttendance -Profiie $profiie -Config $p_conf -Embed $embed -IsReusing $is_reusing }
-			'skland' { Invoke-SklandAttendance -Profiie $profiie -Config $p_conf -Embed $embed -IsReusing $is_reusing }
-			Default { Out-Log -Level 'ERROR' -Message "Unknown platform: $platform"; continue }
+		$result = $null
+		try {
+			if ($null -ne $preflightError) {
+				$result = $preflightError
+			}
+			else {
+				$result = switch ($platform) {
+					'hoyolab' { Invoke-HoyolabCheckin -Profiie $profiie -Config $p_conf -Embed $embed -IsReusing $is_reusing }
+					'fuhouse' { Invoke-FuhouseAttendance -Profiie $profiie -Config $p_conf -Embed $embed -IsReusing $is_reusing }
+					'skport' { Invoke-SkportAttendance -Profiie $profiie -Config $p_conf -Embed $embed -IsReusing $is_reusing }
+					'skland' { Invoke-SklandAttendance -Profiie $profiie -Config $p_conf -Embed $embed -IsReusing $is_reusing }
+					default { New-AttendanceProfileFailure -Platform 'unknown' -Reason 'UnsupportedPlatform' -Message "Unsupported platform: $platform" }
+				}
+			}
 		}
-		Out-Log -Level 'DEBUG' -Message "Attendance result:`n$($result | ConvertTo-Json -Depth 10)"
+		catch {
+			Out-Log -Level 'ERROR' -Message "Unhandled $platform attendance exception ($($_.Exception.GetType().Name))."
+			$embed.fields += @{ name = 'Error'; value = 'Unexpected attendance exception'; inline = $false }
+			$result = New-AttendanceProfileFailure -Platform $(if ($platform) { $platform } else { 'unknown' }) -Reason 'UnexpectedError' -Message 'Unexpected attendance exception'
+		}
+		if (-not (Test-AttendanceProfileResult -Result $result)) {
+			Out-Log -Level 'ERROR' -Message "Invalid outcome returned by $platform attendance."
+			$embed.fields += @{ name = 'Error'; value = 'Handler returned an invalid outcome'; inline = $false }
+			$result = New-AttendanceProfileFailure -Platform $(if ($platform) { $platform } else { 'unknown' }) -Reason 'InvalidResult' -Message 'Handler returned an invalid outcome'
+		}
+		Complete-AttendanceEmbed -Result $result -Embed $embed | Out-Null
+		$confirmedCount = @($result.Items | Where-Object { $_.Kind -in @('Signed', 'AlreadySigned') }).Count
+		$failedCount = @($result.Items | Where-Object { $_.Kind -eq 'Failed' }).Count
+		$statusLevel = switch ($result.Kind) {
+			'Success' { 'INFO' }
+			'PartialFailure' { 'WARN' }
+			default { 'ERROR' }
+		}
+		Out-Log -Level $statusLevel -Message "Profile #$profile_idx ($platform): $($result.Kind); confirmed=$confirmedCount, failed=$failedCount, reason=$($result.Reason)"
 
 		foreach ($bot_name in $bot_results.Keys) {
 			$bot_data = $bot_results[$bot_name]
 			$bot_config = $bot_data.BotConfig
 			if (Test-DiscordBotProfileMatch -BotConfig $bot_config -Profile $profiie -ProfileIndex $profile_idx) {
 				$bot_data.Embeds += $embed
-				if ($null -ne $result -and $result.NeedPing) { $bot_data.AnyNeedPing = $true }
+				if (Test-AttendanceRequiresPing -Result $result) { $bot_data.AnyNeedPing = $true }
 			}
 		}
 	}
@@ -135,12 +160,12 @@ function Invoke-AnimeAttendance {
 	foreach ($bot_name in $bot_results.Keys) {
 		$bot_data = $bot_results[$bot_name]
 		if ($bot_data.Embeds.Count) {
-			Out-Log -Level 'DEBUG' -Message "Sending notification:`n$($bot_data | ConvertTo-Json -Depth 10)"
+			Out-Log -Level 'DEBUG' -Message "Sending notification:`n$(Format-LogObject -InputObject $bot_data)"
 			Send-DiscordNotification -BotConfig $bot_data.BotConfig -Embeds $bot_data.Embeds -NeedPing $bot_data.AnyNeedPing -PingString (Get-DiscordPing -PingConfig $bot_data.BotConfig.ping) -GlobalConfig $conf
 		}
 	}
 
-	if ($conf.display.console -is [string] -and $conf.display.console -eq 'pause') {
+	if ($conf.runtime.pause -and (Get-AnimeAttendanceConsoleSettings -Config $conf).Enabled) {
 		Out-Log -Level 'INFO' -Message 'Press ENTER to continue ...'
 		Read-Host
 	}

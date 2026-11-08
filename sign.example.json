@@ -1,6 +1,6 @@
 {
 	"display": {
-		"console": true,
+		"console": { "enabled": true, "redact": "always" },
 		"discord": {
 			"bots": [
 				{

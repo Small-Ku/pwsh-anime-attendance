@@ -82,14 +82,17 @@ function ConvertFrom-SkRequestError {
 			}
 			if ($respBody) {
 				$json = $respBody | ConvertFrom-Json
-				if ($null -ne $json.code) { return $json }
+				if ($null -ne $json.code) {
+					$json | Add-Member -NotePropertyName __HttpStatus -NotePropertyValue $statusCode -Force
+					return $json
+				}
 				if ($json.message) { $msg = $json.message }
 			}
 		}
 		catch {}
 	}
 
-	return @{ code = $code; message = $msg }
+	return @{ code = $code; message = $msg; __TransportFailure = $true; __HttpStatus = $statusCode }
 }
 
 if (-not $script:SkEndfieldResourceNameMapByLang) {
@@ -238,7 +241,7 @@ function Invoke-SkPassportRequest {
 	if ($null -ne $Body -and $Body -ne '') { $params.Body = ConvertTo-SkCompactJson -Value $Body }
 	try {
 		$ret = Invoke-RestMethod @params
-		Out-Log -Level 'DEBUG' -Message "[$($Ctx.ProviderProfile.name)-passport] ${Method} ${uri}: $($ret | ConvertTo-Json -Depth 10)"
+		Out-Log -Level 'DEBUG' -Message "[$($Ctx.ProviderProfile.name)-passport] ${Method} ${uri}: $(Format-LogObject -InputObject $ret)"
 		return $ret
 	}
 	catch { return ConvertFrom-SkRequestError -ErrorRecord $_ }
@@ -303,18 +306,41 @@ function Invoke-SkApiRequest {
 
 	try {
 		$ret = Invoke-RestMethod @params
-		Out-Log -Level 'DEBUG' -Message "[$($Ctx.ProviderProfile.name)] ${Method} ${uri}: $($ret | ConvertTo-Json -Depth 10)"
+		Out-Log -Level 'DEBUG' -Message "[$($Ctx.ProviderProfile.name)] ${Method} ${uri}: $(Format-LogObject -InputObject $ret)"
 		return $ret
 	}
 	catch { return ConvertFrom-SkRequestError -ErrorRecord $_ }
 }
 
+function Test-SkAuthenticationRejection {
+	param($Response)
+	if ($null -eq $Response) { return $false }
+	return (($Response.__HttpStatus -eq 401) -or ($Response.code -eq 10000))
+}
+
+function Invoke-SkAuthorizedApiRequest {
+	param($Method, [string]$Path, $Body, $Ctx, $Query)
+
+	$response = Invoke-SkApiRequest -Method $Method -Path $Path -Body $Body -Ctx $Ctx -Query $Query
+	if ($Ctx.ProviderProfile.name -ne 'skport' -or
+		$Path -eq $Ctx.ProviderProfile.paths.refresh -or
+		-not (Test-SkAuthenticationRejection -Response $response)) {
+		return $response
+	}
+	# A 401 means the server did not accept this operation. Refresh once,
+	# then retry exactly once. Never retry a POST after an ambiguous timeout.
+	Out-Log -Level 'WARN' -Message 'Skport rejected authentication. Refreshing token and retrying once.'
+	if (-not (Initialize-SkAuthState -Ctx $Ctx)) { return $response }
+	return Invoke-SkApiRequest -Method $Method -Path $Path -Body $Body -Ctx $Ctx -Query $Query
+}
 function Initialize-SkAuthState {
 	param($Ctx)
+	$Ctx.LastAuthFailure = $null
 	$mode = $Ctx.ProviderProfile.auth.mode
 	if ($mode -eq 'refresh') {
 		$res = Invoke-SkApiRequest -Method 'Get' -Path $Ctx.ProviderProfile.paths.refresh -Ctx $Ctx
 		if ($res.code -ne 0) {
+			$Ctx.LastAuthFailure = @{ Stage = 'refresh'; Code = $res.code; Message = [string]$res.message; Response = $res }
 			Out-Log -Level 'WARN' -Message "$($Ctx.ProviderProfile.name) token refresh failed ($($res.code)): $($res.message)"
 			return $false
 		}
@@ -326,13 +352,16 @@ function Initialize-SkAuthState {
 	$grantBody = @{ appCode = $Ctx.ProviderProfile.auth.appCode; token = Resolve-SkPassportToken -Token $Ctx.Profile.token; type = $Ctx.ProviderProfile.auth.grantType }
 	$grant = Invoke-SkPassportRequest -Method 'Post' -Path $Ctx.ProviderProfile.passport.grant -Body $grantBody -Ctx $Ctx
 	if ($grant.status -ne 0 -or -not $grant.data.code) {
-		$errMsg = if ($grant.msg) { $grant.msg } elseif ($grant.message) { $grant.message } else { 'Unknown error' }
+		$errMsg = if ($grant.msg) { $grant.msg } elseif ($grant.message) { $grant.message } elseif ($grant.error) { $grant.error } else { 'Unknown error' }
+		$Ctx.LastAuthFailure = @{ Stage = 'passport_grant'; Code = $grant.status; Message = [string]$errMsg; Response = $grant }
 		Out-Log -Level 'WARN' -Message "$($Ctx.ProviderProfile.name) grant authorize code failed: $errMsg"
 		return $false
 	}
 	$authBody = @{ code = $grant.data.code; kind = $Ctx.ProviderProfile.auth.kind }
 	$res = Invoke-SkApiRequest -Method 'Post' -Path $Ctx.ProviderProfile.auth.credPath -Body $authBody -Ctx $Ctx
 	if ($res.code -ne 0) {
+		$errMsg = if ($res.msg) { $res.msg } elseif ($res.message) { $res.message } elseif ($res.error) { $res.error } else { 'Unknown error' }
+		$Ctx.LastAuthFailure = @{ Stage = 'generate_cred'; Code = $res.code; Message = [string]$errMsg; Response = $res }
 		Out-Log -Level 'WARN' -Message "$($Ctx.ProviderProfile.name) generate cred failed ($($res.code)): $($res.message)"
 		return $false
 	}
@@ -343,20 +372,31 @@ function Initialize-SkAuthState {
 	return $true
 }
 
+function Get-SkDataResult {
+	param($Ctx, [string]$Path, [string]$Operation)
+	$res = Invoke-SkAuthorizedApiRequest -Method 'Get' -Path $Path -Ctx $Ctx
+	if ($null -eq $res -or $null -eq $res.code) {
+		return [pscustomobject]@{ Kind = 'Failure'; Reason = 'InvalidResponse'; Message = "$Operation response missing code"; Data = $null }
+	}
+	if ($res.code -ne 0) {
+		$reason = if (Test-SkAuthenticationRejection -Response $res) { 'AuthenticationFailed' } elseif ($res.__HttpStatus -gt 0) { 'HttpError' } elseif ($res.__TransportFailure) { 'TransportError' } else { 'ProviderRejected' }
+		Out-Log -Level 'WARN' -Message "$($Ctx.ProviderProfile.name) $Operation failed (code $($res.code))"
+		return [pscustomobject]@{ Kind = 'Failure'; Reason = $reason; Message = "$Operation failed (code $($res.code))"; Data = $null }
+	}
+	if ($null -eq $res.data) {
+		return [pscustomobject]@{ Kind = 'Failure'; Reason = 'InvalidResponse'; Message = "$Operation response missing data"; Data = $null }
+	}
+	return [pscustomobject]@{ Kind = 'Success'; Reason = ''; Message = ''; Data = $res.data }
+}
+
 function Get-SkUserData {
 	param($Ctx)
-	$res = Invoke-SkApiRequest -Method 'Get' -Path $Ctx.ProviderProfile.paths.user -Ctx $Ctx
-	if ($res.code -eq 0) { return $res.data }
-	Out-Log -Level 'WARN' -Message "$($Ctx.ProviderProfile.name) user error ($($res.code)): $($res.message)"
-	return $null
+	return Get-SkDataResult -Ctx $Ctx -Path $Ctx.ProviderProfile.paths.user -Operation 'User lookup'
 }
 
 function Get-SkBindingData {
 	param($Ctx)
-	$res = Invoke-SkApiRequest -Method 'Get' -Path $Ctx.ProviderProfile.paths.binding -Ctx $Ctx
-	if ($res.code -eq 0) { return $res.data }
-	Out-Log -Level 'WARN' -Message "$($Ctx.ProviderProfile.name) binding error ($($res.code)): $($res.message)"
-	return $null
+	return Get-SkDataResult -Ctx $Ctx -Path $Ctx.ProviderProfile.paths.binding -Operation 'Binding lookup'
 }
 
 function Expand-SkRoles {
@@ -386,8 +426,19 @@ function Expand-SkRoles {
 				}
 			}
 			else {
-				foreach ($role in $binding.roles) {
-					$roles += @{ appCode = $app.appCode; gameId = $binding.gameId; roleId = $role.roleId; serverId = $role.serverId; nickname = Format-Text -Text $role.nickname; serverName = Format-Text -Text $role.serverName }
+				foreach ($role in @($binding.roles)) {
+					$roles += @{
+						appCode = $app.appCode
+						gameId = $binding.gameId
+						gameName = Format-Text -Text $binding.gameName
+						channelName = Format-Text -Text $binding.channelName
+						channelMasterId = $binding.channelMasterId
+						uid = $binding.uid
+						roleId = $role.roleId
+						serverId = $role.serverId
+						nickname = Format-Text -Text $role.nickname
+						serverName = Format-Text -Text $role.serverName
+					}
 				}
 			}
 		}
@@ -486,6 +537,162 @@ function Get-SkFieldKey {
 	return "$($Role.appCode)|$channelKey|$($Role.uid)|$($Role.roleId)|$($Role.serverId)|$($Role.serverName)"
 }
 
+function Get-SklandProfileDeviceCacheScope {
+	param($Profile)
+
+	$deviceConfig = Get-SklandDeviceConfigProperty -DeviceConfig $Profile -Names @('device')
+	$deviceRef = Get-SklandDeviceConfigProperty -DeviceConfig $Profile -Names @('device_ref')
+	if (-not $deviceRef) {
+		$deviceRef = Get-SklandDeviceConfigProperty -DeviceConfig $deviceConfig -Names @('device_ref')
+	}
+	if ($deviceRef -and -not [string]::IsNullOrWhiteSpace([string]$deviceRef)) {
+		# Sharing is opt-in. The same explicit reference is the only way for
+		# different profiles to use one process-level dId cache entry.
+		return "ref:$(([string]$deviceRef).Trim())"
+	}
+
+	$token = Get-SklandDeviceConfigProperty -DeviceConfig $Profile -Names @('token')
+	if ($token -and -not [string]::IsNullOrWhiteSpace([string]$token)) {
+		# The raw token never enters the cache key or a log. Hashing the profile
+		# credential gives stable per-account isolation even if array order changes.
+		return "profile-token:$(Get-SkMd5Hex -Text ([string]$token))"
+	}
+
+	$consoleName = Get-SklandDeviceConfigProperty -DeviceConfig $Profile -Names @('console_name')
+	if ($consoleName -and -not [string]::IsNullOrWhiteSpace([string]$consoleName)) {
+		return "profile-name:$(([string]$consoleName).Trim())"
+	}
+
+	# Skland profiles are required to have a token before this function is
+	# reached. Keep a non-sharing fallback for malformed/direct callers.
+	return "profile-object:$([System.Runtime.CompilerServices.RuntimeHelpers]::GetHashCode([object]$Profile))"
+}
+
+function Get-SklandProfileDeviceConfig {
+	param(
+		$Profile,
+		[switch]$Create
+	)
+
+	$deviceConfig = Get-SklandDeviceConfigProperty -DeviceConfig $Profile -Names @('device')
+	if ($null -eq $deviceConfig -and $Create) {
+		$deviceConfig = [pscustomobject]@{}
+		if ($Profile -is [System.Collections.IDictionary]) {
+			$Profile['device'] = $deviceConfig
+		}
+		else {
+			$Profile | Add-Member -MemberType NoteProperty -Name 'device' -Value $deviceConfig -Force
+		}
+	}
+	return $deviceConfig
+}
+
+function Set-SklandDeviceConfigProperty {
+	param(
+		$DeviceConfig,
+		[Parameter(Mandatory = $true)]
+		[string]$Name,
+		$Value
+	)
+
+	if ($DeviceConfig -is [System.Collections.IDictionary]) {
+		$DeviceConfig[$Name] = $Value
+	}
+	else {
+		$DeviceConfig | Add-Member -MemberType NoteProperty -Name $Name -Value $Value -Force
+	}
+}
+
+function Remove-SklandDeviceConfigProperty {
+	param(
+		$DeviceConfig,
+		[Parameter(Mandatory = $true)]
+		[string]$Name
+	)
+
+	if ($DeviceConfig -is [System.Collections.IDictionary]) {
+		if ($DeviceConfig.Contains($Name)) { [void]$DeviceConfig.Remove($Name) }
+	}
+	else {
+		$property = $DeviceConfig.PSObject.Properties[$Name]
+		if ($property) { $DeviceConfig.PSObject.Properties.Remove($Name) }
+	}
+}
+
+function Save-SklandProfileDeviceState {
+	param(
+		$Profile,
+		[Parameter(Mandatory = $true)]
+		[string]$Did,
+		[Parameter(Mandatory = $true)]
+		[string]$Seed
+	)
+
+	if ([string]::IsNullOrWhiteSpace($Did) -or [string]::IsNullOrWhiteSpace($Seed)) { return $false }
+	$deviceConfig = Get-SklandProfileDeviceConfig -Profile $Profile -Create
+	Set-SklandDeviceConfigProperty -DeviceConfig $deviceConfig -Name 'id' -Value $Did.Trim()
+	Set-SklandDeviceConfigProperty -DeviceConfig $deviceConfig -Name 'seed' -Value $Seed.Trim()
+	Register-LogSecret -Secret $Did.Trim() -Label 'device.id'
+	Register-LogSecret -Secret $Seed.Trim() -Label 'device.seed'
+	Register-GitHubLogMasks
+	foreach ($legacyName in @('did', 'device_id', 'device_seed')) {
+		Remove-SklandDeviceConfigProperty -DeviceConfig $deviceConfig -Name $legacyName
+	}
+
+	if ([string]::IsNullOrWhiteSpace([string]$script:AnimeAttendanceConfigPath) -or $null -eq $script:conf) {
+		return $false
+	}
+	Save-AnimeAttendanceConfig -Config $script:conf -Path $script:AnimeAttendanceConfigPath
+	return $true
+}
+
+function Save-SklandProfileDeviceId {
+	param(
+		$Profile,
+		[Parameter(Mandatory = $true)]
+		[string]$Did
+	)
+
+	$deviceConfig = Get-SklandProfileDeviceConfig -Profile $Profile
+	$seed = Get-SklandDeviceConfigProperty -DeviceConfig $deviceConfig -Names @('seed', 'device_seed')
+	if ([string]::IsNullOrWhiteSpace([string]$seed)) { return $false }
+	return Save-SklandProfileDeviceState -Profile $Profile -Did $Did -Seed ([string]$seed)
+}
+
+function Test-SklandDeviceIdRejection {
+	param($Failure)
+
+	if ($null -eq $Failure) { return $false }
+	$code = [string](Get-SklandDeviceConfigProperty -DeviceConfig $Failure -Names @('Code', 'code'))
+	$message = [string](Get-SklandDeviceConfigProperty -DeviceConfig $Failure -Names @('Message', 'message'))
+	$response = Get-SklandDeviceConfigProperty -DeviceConfig $Failure -Names @('Response', 'response')
+	$responseMessage = if ($response) {
+		@('msg', 'message', 'error', 'detail') | ForEach-Object {
+			$value = Get-SklandDeviceConfigProperty -DeviceConfig $response -Names @($_)
+			if ($null -ne $value) { [string]$value }
+		}
+	}
+	$text = "$code $message $($responseMessage -join ' ')"
+	if ([string]::IsNullOrWhiteSpace($text)) { return $false }
+
+	# The auth endpoints have used both English and Chinese messages, and their
+	# numeric code is not stable enough to treat as a standalone contract. Only
+	# recover when the response explicitly describes an invalid/rejected device
+	# or dId; token, timestamp, and generic auth failures must remain failures.
+	$patterns = @(
+		'(?i)\b(?:invalid|illegal|unknown|expired|rejected|not\s+found|unregistered)\s+(?:skland\s+)?(?:device(?:\s*id)?|dId)\b',
+		'(?i)\b(?:device(?:\s*id)?|dId)\b.{0,60}(?:invalid|illegal|unknown|expired|rejected|not\s+found|unregistered)',
+		'(?i)(?:invalid|illegal|unknown|expired|rejected|not\s+found|unregistered).{0,60}(?:device|fingerprint|dId)',
+		'(?i)\b(?:device(?:\s*id)?|dId|fingerprint)\b.{0,60}(?:error|failed|failure|denied)',
+		'(?:設備|装置|裝置|设备|指紋|指纹|dId).{0,60}(?:無效|无效|失效|拒絕|拒绝|不存在|未知|過期|过期|錯誤|错误|失敗|失败|不合法|非法|不正確|不正确|驗證失敗|验证失败|校驗失敗|校验失败)',
+		'(?:無效|无效|失效|拒絕|拒绝|不存在|未知|過期|过期|錯誤|错误|失敗|失败|不合法|非法|不正確|不正确|驗證失敗|验证失败|校驗失敗|校验失败).{0,60}(?:設備|装置|裝置|设备|指紋|指纹|dId)'
+	)
+	foreach ($pattern in $patterns) {
+		if ($text -match $pattern) { return $true }
+	}
+	return $false
+}
+
 function Invoke-SkAttendanceCore {
 	param(
 		[string]$Provider,
@@ -497,51 +704,167 @@ function Invoke-SkAttendanceCore {
 
 	if (-not $PlatformConfig -or -not $PlatformConfig.games -or $PlatformConfig.games.Count -eq 0) {
 		Out-Log -Level 'ERROR' -Message "No ${Provider} games configured."
-		return $null
+		return New-AttendanceProfileFailure -Platform $Provider -Reason 'InvalidConfiguration' -Message 'No games configured'
 	}
 	if ($Provider -eq 'skport' -and -not $Profile.cred) {
 		Out-Log -Level 'ERROR' -Message 'Skport profile missing cred.'
 		$Embed.fields += @{ 'name' = 'Skport'; 'value' = 'Missing cred'; 'inline' = $true }
-		return @{ NeedPing = $true }
+		return New-AttendanceProfileFailure -Platform $Provider -Reason 'InvalidConfiguration' -Message 'Missing cred'
 	}
 	if ($Provider -eq 'skland' -and -not $Profile.token) {
 		Out-Log -Level 'ERROR' -Message 'Skland profile missing token.'
 		$Embed.fields += @{ 'name' = 'Skland'; 'value' = 'Missing token'; 'inline' = $true }
-		return @{ NeedPing = $true }
+		return New-AttendanceProfileFailure -Platform $Provider -Reason 'InvalidConfiguration' -Message 'Missing token'
 	}
 
 	$providerProfile = Get-SkProviderProfile -Provider $Provider
 	$did = ''
+	$deviceConfig = $null
+	$deviceScope = $null
+	$deviceSeed = ''
+	$hadConfiguredDeviceId = $false
+	$generatedDeviceSeed = $false
+	$isGitHubActions = [string]::Equals([string]$env:GITHUB_ACTIONS, 'true', [System.StringComparison]::OrdinalIgnoreCase)
 	if ($Provider -eq 'skland') {
-		try { $did = Get-SklandDid }
+		$deviceConfig = Get-SklandProfileDeviceConfig -Profile $Profile
+		$deviceOptions = Get-SklandDeviceOptions -DeviceConfig $deviceConfig
+		$hadConfiguredDeviceId = -not [string]::IsNullOrWhiteSpace([string]$deviceOptions.Did)
+		$deviceSeed = [string]$deviceOptions.Seed
+		if (-not $hadConfiguredDeviceId -and [string]::IsNullOrWhiteSpace($deviceSeed)) {
+			if ($isGitHubActions) {
+				Write-SklandDeviceDiagnostic -Message 'Skland device.id and device.seed are both missing in GitHub Actions; refusing to create an ephemeral device. Run locally once and persist the profile device state before using Actions.'
+				$Embed.fields += @{ 'name' = 'Skland'; 'value' = 'Missing persistent device identity'; 'inline' = $true }
+				return New-AttendanceProfileFailure -Platform $Provider -Reason 'InvalidConfiguration' -Message 'Missing persistent device identity'
+			}
+			$deviceConfig = Get-SklandProfileDeviceConfig -Profile $Profile -Create
+			$deviceSeed = [guid]::NewGuid().ToString()
+			Set-SklandDeviceConfigProperty -DeviceConfig $deviceConfig -Name 'seed' -Value $deviceSeed
+			$generatedDeviceSeed = $true
+		}
+		elseif (-not $hadConfiguredDeviceId) {
+			Write-SklandDeviceDiagnostic -Message 'Skland device ID is missing; recovering from persistent device seed.'
+		}
+		$deviceScope = Get-SklandProfileDeviceCacheScope -Profile $Profile
+		try { $did = Get-SklandDid -DeviceConfig $deviceConfig -CacheScopeKey $deviceScope }
 		catch {
-			Out-Log -Level 'WARN' -Message $_.Exception.Message
+			Write-SklandDeviceDiagnostic -Message $_.Exception.Message
 			$Embed.fields += @{ 'name' = 'Skland'; 'value' = 'Failed to register device'; 'inline' = $true }
-			return @{ NeedPing = $true }
+			return New-AttendanceProfileFailure -Platform $Provider -Reason 'DeviceRegistrationFailed' -Message 'Failed to register device'
+		}
+		if (-not $hadConfiguredDeviceId) {
+			try {
+				if (-not (Save-SklandProfileDeviceState -Profile $Profile -Did $did -Seed $deviceSeed)) {
+					if ($generatedDeviceSeed) {
+						Write-SklandDeviceDiagnostic -Message 'Skland device registration succeeded, but the generated device seed and dId could not be persisted. Refusing to continue with an ephemeral device; run locally with a writable sign.json.'
+						$Embed.fields += @{ 'name' = 'Skland'; 'value' = 'Could not persist device identity'; 'inline' = $true }
+						return New-AttendanceProfileFailure -Platform $Provider -Reason 'DevicePersistenceFailed' -Message 'Could not persist device identity'
+					}
+					Write-SklandDeviceDiagnostic -Message 'Recovered Skland device for this run, but the recovered device ID cannot be persisted back to CHECK_SECRET automatically. Run locally once and update CHECK_SECRET to avoid re-registration.'
+				}
+				elseif ($isGitHubActions) {
+					Write-SklandDeviceDiagnostic -Message 'Recovered Skland device for this run, but the recovered device ID cannot be persisted back to CHECK_SECRET automatically. Run locally once and update CHECK_SECRET to avoid re-registration.'
+				}
+			}
+			catch {
+				if ($generatedDeviceSeed) {
+					Write-SklandDeviceDiagnostic -Message "Skland device registration succeeded, but persisting the generated device identity failed: $($_.Exception.Message)"
+					$Embed.fields += @{ 'name' = 'Skland'; 'value' = 'Could not persist device identity'; 'inline' = $true }
+					return New-AttendanceProfileFailure -Platform $Provider -Reason 'DevicePersistenceFailed' -Message 'Could not persist device identity'
+				}
+				Write-SklandDeviceDiagnostic -Message 'Recovered Skland device for this run, but the recovered device ID cannot be persisted back to CHECK_SECRET automatically. Run locally once and update CHECK_SECRET to avoid re-registration.'
+			}
 		}
 	}
 	$ctx = @{ Profile = $Profile; ProviderProfile = $providerProfile; PlatformConfig = $PlatformConfig; GameConfig = $PlatformConfig.games[0]; Cred = $Profile.cred; Token = $null; TimeOffset = 0; DId = $did; SkGameRole = $null }
-	if (-not (Initialize-SkAuthState -Ctx $ctx)) {
+	$authInitialized = Initialize-SkAuthState -Ctx $ctx
+	if (-not $authInitialized -and $Provider -eq 'skland' -and $hadConfiguredDeviceId) {
+		if ($deviceSeed -and (Test-SklandDeviceIdRejection -Failure $ctx.LastAuthFailure)) {
+			Write-SklandDeviceDiagnostic -Message 'Configured Skland device ID was rejected. Re-enrolling with the persistent device seed and retrying authentication.'
+			$replacementDid = $null
+			try {
+				$replacementDid = Get-SklandDid -DeviceConfig $deviceConfig -CacheScopeKey $deviceScope -ForceProvision
+			}
+			catch {
+				Write-SklandDeviceDiagnostic -Message "Skland device recovery registration failed: $($_.Exception.Message)"
+			}
+			if ($replacementDid) {
+				$did = $replacementDid
+				$ctx.DId = $replacementDid
+				$ctx.Token = $null
+				$ctx.Cred = $Profile.cred
+				$ctx.TimeOffset = 0
+				$authInitialized = Initialize-SkAuthState -Ctx $ctx
+				if ($authInitialized) {
+					$persistedReplacement = $false
+					try { $persistedReplacement = Save-SklandProfileDeviceState -Profile $Profile -Did $replacementDid -Seed $deviceSeed }
+					catch {
+						Write-SklandDeviceDiagnostic -Message "Recovered Skland device for this run, but persisting the replacement device ID failed: $($_.Exception.Message)"
+					}
+					if (-not $persistedReplacement -or $isGitHubActions) {
+						Write-SklandDeviceDiagnostic -Message 'Recovered the Skland device using its persistent seed. Update sign.json locally to persist the replacement device ID.'
+					}
+					else {
+						Write-SklandDeviceDiagnostic -Message 'Configured Skland device ID was rejected. Recovered the device using its persistent seed, and persisted the replacement device ID to sign.json.'
+					}
+				}
+			}
+		}
+		elseif (Test-SklandDeviceIdRejection -Failure $ctx.LastAuthFailure) {
+			Write-SklandDeviceDiagnostic -Message 'Configured Skland device ID was rejected, but no persistent device seed is available for recovery. Run locally once with recovery state configured before retrying.'
+		}
+	}
+	if (-not $authInitialized) {
 		$Embed.fields += @{ 'name' = ("{0}" -f ($Provider.Substring(0,1).ToUpper() + $Provider.Substring(1))); 'value' = 'Failed to initialize auth state'; 'inline' = $true }
-		return @{ NeedPing = $true }
+		return New-AttendanceProfileFailure -Platform $Provider -Reason 'AuthenticationFailed' -Message 'Failed to initialize auth state'
 	}
 
-	$userData = Get-SkUserData -Ctx $ctx
-	$nickname = Get-SkValueByPath -Data $userData -Path $providerProfile.user_extract.nickname
-	$userId = Get-SkValueByPath -Data $userData -Path $providerProfile.user_extract.id
+	$userResult = Get-SkUserData -Ctx $ctx
+	if ($userResult.Kind -ne 'Success') {
+		$Embed.fields += @{ name = $Provider; value = $userResult.Message; inline = $false }
+		return New-AttendanceProfileFailure -Platform $Provider -Reason $userResult.Reason -Message $userResult.Message
+	}
+	$nickname = Get-SkValueByPath -Data $userResult.Data -Path $providerProfile.user_extract.nickname
+	$userId = Get-SkValueByPath -Data $userResult.Data -Path $providerProfile.user_extract.id
+	if ([string]::IsNullOrWhiteSpace([string]$nickname) -or [string]::IsNullOrWhiteSpace([string]$userId)) {
+		$Embed.fields += @{ name = $Provider; value = 'User response missing required identity'; inline = $false }
+		return New-AttendanceProfileFailure -Platform $Provider -Reason 'InvalidResponse' -Message 'User response missing required identity'
+	}
+	Register-LogSecret -Secret $userId -Label 'id'
+	Register-GitHubLogMasks
 	$Embed.title = if ($nickname) { Format-Text -Text $nickname } else { "Unknown $Provider User" }
 	$Embed.description = if ($null -ne $userId) { "ID: ||$userId||" } else { '' }
-	$Embed.color = '5635840'
 
-	$bindingData = Get-SkBindingData -Ctx $ctx
-	$roles = Expand-SkRoles -BindingData $bindingData -Provider $Provider
+	$bindingResult = Get-SkBindingData -Ctx $ctx
+	if ($bindingResult.Kind -ne 'Success') {
+		$Embed.fields += @{ name = $Provider; value = $bindingResult.Message; inline = $false }
+		return New-AttendanceProfileFailure -Platform $Provider -Reason $bindingResult.Reason -Message $bindingResult.Message
+	}
+	if (-not ((($bindingResult.Data -is [System.Collections.IDictionary]) -and $bindingResult.Data.Contains('list')) -or (($bindingResult.Data -isnot [System.Collections.IDictionary]) -and $bindingResult.Data.PSObject.Properties.Name -contains 'list'))) {
+		$Embed.fields += @{ name = $Provider; value = 'Binding response missing list'; inline = $false }
+		return New-AttendanceProfileFailure -Platform $Provider -Reason 'InvalidResponse' -Message 'Binding response missing list'
+	}
+	$roles = @(Expand-SkRoles -BindingData $bindingResult.Data -Provider $Provider)
 	if ($roles.Count -eq 0) {
-		Out-Log -Level 'WARN' -Message "No bound roles found for $Provider user."
-		$Embed.fields += @{ 'name' = ("{0}" -f ($Provider.Substring(0,1).ToUpper() + $Provider.Substring(1))); 'value' = 'No bound roles found'; 'inline' = $true }
-		return $null
+		Out-Log -Level 'ERROR' -Message "No bound roles found for $Provider user."
+		$Embed.fields += @{ name = $Provider; value = 'No bound roles found'; inline = $true }
+		return New-AttendanceProfileFailure -Platform $Provider -Reason 'NoBoundRoles' -Message 'No bound roles found'
 	}
 
-	$anyPing = $false
+	foreach ($role in $roles) {
+		foreach ($field in @(
+			@{ Name = 'uid'; Value = $role.uid },
+			@{ Name = 'role_id'; Value = $role.roleId },
+			@{ Name = 'server_id'; Value = $role.serverId },
+			@{ Name = 'game_id'; Value = $role.gameId },
+			@{ Name = 'channelMasterId'; Value = $role.channelMasterId }
+		)) {
+			Register-LogSecret -Secret $field.Value -Label $field.Name
+		}
+		Register-LogSecret -Secret (Get-SkFieldKey -Role $role) -Label 'identity_key'
+	}
+	Register-GitHubLogMasks
+
+	$itemResults = @()
 	foreach ($role in $roles) {
 		$game = $PlatformConfig.games | Where-Object { $_.app_code -eq $role.appCode } | Select-Object -First 1
 		if (-not $game) { continue }
@@ -556,26 +879,59 @@ function Invoke-SkAttendanceCore {
 		$body = if ($ep.body -eq 'uid_gameId') { @{ uid = $role.uid; gameId = $role.gameId } } else { '' }
 		$query = if ($ep.query -eq 'uid_gameId') { @{ uid = $role.uid; gameId = $role.gameId } } else { $null }
 
-		Out-Log -Level 'INFO' -Message "Checking in for $($ident.identity) ($($ident.title))"
-		$resPost = Invoke-SkApiRequest -Method 'Post' -Path $postPath -Body $body -Ctx $roleCtx
-		Out-Log -Level 'INFO' -Message "Checking status for $($ident.identity) ($($ident.title))"
-		$resGet = Invoke-SkApiRequest -Method 'Get' -Path $getPath -Ctx $roleCtx -Query $query
-
-		$data = $null
-		$isAlready = $false
-		if ($resPost.code -eq 0) { $data = $resPost.data }
-		elseif ($resGet.code -eq 0) {
-			$data = $resGet.data
-			$isAlready = [bool]$resGet.data.hasToday
-			if (-not $isAlready -and $resGet.data.calendar) { $isAlready = [bool]($resGet.data.calendar | Where-Object { $_.done } | Select-Object -Last 1) }
+		$resPost = $null
+		$resGet = $null
+		$alreadyConfirmed = $false
+		if ($Provider -eq 'skport') {
+			# Skport exposes a reliable "hasToday" status. Check before POST:
+			# it avoids duplicate writes and refuses to sign if status/auth is unknown.
+			Out-Log -Level 'INFO' -Message "Checking status for $($ident.identity) ($($ident.title))"
+			$resGet = Invoke-SkAuthorizedApiRequest -Method 'Get' -Path $getPath -Ctx $roleCtx -Query $query
+			if ($null -ne $resGet -and $resGet.code -eq 0 -and $null -ne $resGet.data -and $resGet.data.hasToday -eq $true) {
+				$alreadyConfirmed = $true
+			}
+			elseif ($null -ne $resGet -and $resGet.code -eq 0 -and $null -ne $resGet.data -and $resGet.data.hasToday -eq $false) {
+				Out-Log -Level 'INFO' -Message "Checking in for $($ident.identity) ($($ident.title))"
+				$resPost = Invoke-SkAuthorizedApiRequest -Method 'Post' -Path $postPath -Body $body -Ctx $roleCtx
+				$resGet = Invoke-SkAuthorizedApiRequest -Method 'Get' -Path $getPath -Ctx $roleCtx -Query $query
+			}
+			else {
+				$reason = if (Test-SkAuthenticationRejection -Response $resGet) { 'AuthenticationFailed' } else { 'StatusUnavailable' }
+				Out-Log -Level 'ERROR' -Message "Cannot verify Skport attendance state for $($ident.title)."
+				$Embed.fields += @{ name = $ident.title; value = 'Attendance status unavailable; no check-in attempted'; inline = $true; key = $fieldKey }
+				$itemResults += New-AttendanceItemResult -Kind 'Failed' -Identity $fieldKey -Detail 'Initial attendance status unavailable' -Reason $reason
+				continue
+			}
 		}
 		else {
-			Out-Log -Level 'ERROR' -Message "[$($ident.identity)] Error (Code: $($resPost.code)): $($resPost.message)"
-			$Embed.fields += @{ 'name' = $ident.title; 'value' = "$($ident.identity)`nERROR: $($resPost.code) $($resPost.message)"; 'inline' = $true; 'key' = $fieldKey }
-			$anyPing = $true
-			continue
+			Out-Log -Level 'INFO' -Message "Checking in for $($ident.identity) ($($ident.title))"
+			$resPost = Invoke-SkAuthorizedApiRequest -Method 'Post' -Path $postPath -Body $body -Ctx $roleCtx
+			Out-Log -Level 'INFO' -Message "Checking status for $($ident.identity) ($($ident.title))"
+			$resGet = Invoke-SkAuthorizedApiRequest -Method 'Get' -Path $getPath -Ctx $roleCtx -Query $query
 		}
 
+		$data = $null
+		$isAlready = $alreadyConfirmed
+		if ($alreadyConfirmed) {
+			$data = $resGet.data
+		}
+		elseif ($null -ne $resPost -and $resPost.code -eq 0) {
+			$data = $resPost.data
+		}
+		elseif ($null -ne $resGet -and $resGet.code -eq 0 -and $null -ne $resGet.data -and $resGet.data.hasToday -eq $true) {
+			$data = $resGet.data
+			$isAlready = $true
+		}
+		else {
+			$codePost = if ($null -ne $resPost) { $resPost.code } else { 'missing' }
+			$codeGet = if ($null -ne $resGet) { $resGet.code } else { 'missing' }
+			$detail = "Check-in not confirmed (POST: $codePost; GET: $codeGet)"
+			Out-Log -Level 'ERROR' -Message "[$($ident.identity)] $detail"
+			$Embed.fields += @{ name = $ident.title; value = "$($ident.identity): ERROR $detail"; inline = $true; key = $fieldKey }
+			$itemResults += New-AttendanceItemResult -Kind 'Failed' -Identity $fieldKey -Detail $detail -Reason 'CheckInUnconfirmed'
+			continue
+		}
+		$itemResults += New-AttendanceItemResult -Kind $(if ($isAlready) { 'AlreadySigned' } else { 'Signed' }) -Identity $fieldKey
 		$awardLines = Resolve-SkAwardLines -Data $data -Ctx $roleCtx
 		$awardText = $awardLines -join "`n"
 		$awardLogText = $awardLines -join ", "
@@ -590,5 +946,5 @@ function Invoke-SkAttendanceCore {
 		}
 	}
 
-	return @{ NeedPing = $anyPing }
+	return Complete-AttendanceProfileResult -Platform $Provider -Items $itemResults
 }

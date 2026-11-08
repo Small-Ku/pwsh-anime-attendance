@@ -58,8 +58,20 @@ function Send-DiscordNotification {
 	# Embed Management Strategy: List-based with Footer ID matching
 	$AllEmbeds = @()
 
-	# 1. Load Existing Embeds
-	if ($existing_message -and $existing_message.embeds -and -not $BotConfig.overwrite) {
+	# 1. Load Existing Embeds.
+	# The previous message is only a safe source for omitted reward fields when
+	# all its embeds were successful. Otherwise a recovered profile may retain
+	# yesterday's error field in a green embed.
+	$previousAllSucceeded = $true
+	if ($existing_message -and $existing_message.embeds) {
+		foreach ($previousEmbed in $existing_message.embeds) {
+			if ([string]$previousEmbed.color -ne '5635840') {
+				$previousAllSucceeded = $false
+				break
+			}
+		}
+	}
+	if ($existing_message -and $existing_message.embeds -and -not $BotConfig.overwrite -and -not $NeedPing -and $previousAllSucceeded) {
 		foreach ($ex_embed in $existing_message.embeds) {
 			# Create a field map for fast lookups/updates
 			$field_map = [ordered]@{}
@@ -203,7 +215,7 @@ function Send-DiscordNotification {
 
 	$discord_body_json = $discord_body | ConvertTo-Json -Depth 10
 
-	Out-Log -Level 'DEBUG' -Message "Discord message body for bot $($BotConfig.discord_name):`n$discord_body_json"
+	Out-Log -Level 'DEBUG' -Message "Discord message body for bot $($BotConfig.discord_name):`n$(Format-LogObject -InputObject $discord_body)"
 
 	if ($reuse_id -and $reuse_id -match '^\d{18,}$') {
 		$uri = "$($BotConfig.webhook_url)/messages/$reuse_id"
@@ -214,12 +226,16 @@ function Send-DiscordNotification {
 		$ret = Invoke-RestMethod -Method 'Post' -Uri $uri -Body $discord_body_json -ContentType 'application/json;charset=UTF-8'
 		if ($BotConfig.reuse_msg -eq 'true' -or $BotConfig.reuse_msg -eq $true) {
 			$BotConfig.reuse_msg = $ret.id
-			$GlobalConfig | ConvertTo-Json -Depth 10 | Set-Content .\sign.json -Encoding 'UTF8'
+			Save-AnimeAttendanceConfig -Config $GlobalConfig -Path $script:AnimeAttendanceConfigPath
 		}
 	}
 
-	if ($NeedPing) {
+	if ($NeedPing -and -not [string]::IsNullOrWhiteSpace([string]$PingString)) {
 		$ping_body = @{ 'content' = $PingString } | ConvertTo-Json
 		Invoke-RestMethod -Method 'Post' -Uri $BotConfig.webhook_url -Body $ping_body -ContentType 'application/json;charset=UTF-8'
 	}
+	elseif ($NeedPing) {
+		Out-Log -Level 'WARN' -Message 'Attendance failed but no Discord ping recipients are configured. The failure embed was still sent.'
+	}
+	Out-Log -Level 'INFO' -Message 'Discord notification HTTP requests completed.'
 }

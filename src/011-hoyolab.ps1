@@ -57,7 +57,7 @@ function Get-HoyolabAccountInfo {
 	$uri = $Config.account.api_base + '/auth/api/getUserAccountInfoByLToken'
 	$ret = Invoke-RestMethod -Method 'Get' -Uri $uri -Headers $headers -ContentType 'application/json;charset=UTF-8' -UserAgent $Config.user_agent -WebSession $session
 
-	Out-Log -Level 'DEBUG' -Message "Account info: $ret data: $($ret.data)"
+	Out-Log -Level 'DEBUG' -Message "Account info: $(Format-LogObject -InputObject $ret)"
 
 	if ($ret.retcode -eq 0) {
 		$display_name = ''
@@ -79,11 +79,13 @@ function Invoke-HoyolabCheckin {
 	if (-not $cookieResult.IsValid) {
 		$logMsg = if ($Profiie.console_name) { $Profiie.console_name } else { "Unknown" }
 		Out-Log -Level 'ERROR' -Message "Invalid cookie format for profile: $logMsg"
-		return @{ NeedPing = $true }
+		return New-AttendanceProfileFailure -Platform 'hoyolab' -Reason 'AuthenticationFailed' -Message 'Missing or rejected credentials'
 	}
 
+	$items = @()
 	$jar = $cookieResult.Jar
 	$ltuid = $cookieResult.ltuid
+	if ($ltuid -and $ltuid -ne 'Unknown') { Register-LogSecret -Secret $ltuid -Label 'ltuid'; Register-GitHubLogMasks }
 
 	$display_name = $ltuid -replace '^(\d{2})\d+(\d{2})$', '$1****$2'
 	$Embed.title = $display_name -replace '\*', '\*'
@@ -98,12 +100,12 @@ function Invoke-HoyolabCheckin {
 	elseif (-not $ac_info.Success) {
 		$Embed.fields += @{ 'name' = 'Account'; 'value' = $ac_info.Message }
 		Out-Log -Level 'ERROR' -Message "Failed to get account info for ${ltuid}: $($ac_info.Message)"
+		$items += New-AttendanceItemResult -Kind 'Failed' -Identity 'Account' -Reason 'AccountLookupFailed' -Detail 'Account information unavailable'
 		if ($ac_info.Message -match "login" -or $ac_info.Message -match "cookie") {
-			return @{ NeedPing = $true }
+			return New-AttendanceProfileFailure -Platform 'hoyolab' -Reason 'AuthenticationFailed' -Message 'Missing or rejected credentials'
 		}
 	}
 
-	$any_ping = $false
 	foreach ($game in $Config.games) {
 		Out-Log -Level 'DEBUG' -Message "Signing for: $($game.name)"
 
@@ -132,81 +134,101 @@ function Invoke-HoyolabCheckin {
 		# 1. Get info
 		$api_info_url = "$base_url/event/$($game.game_id)/info?lang=$($Config.lang)&act_id=$act_id"
 		$ret_info = Invoke-RestMethod -Method 'Get' -Uri $api_info_url -Headers $api_headers -ContentType 'application/json;charset=UTF-8' -UserAgent $Config.user_agent -WebSession $session
-		Out-Log -Level 'DEBUG' -Message "Queried info: $ret_info data: $($ret_info.data)"
+		Out-Log -Level 'DEBUG' -Message "Queried info: $(Format-LogObject -InputObject $ret_info)"
 
+		if ($null -eq $ret_info -or ($ret_info.retcode -ne 0 -and $ret_info.retcode -ne -100) -or ($ret_info.retcode -eq 0 -and $null -eq $ret_info.data)) {
+			$Embed.fields += @{ name = $game.name; value = 'Cannot verify attendance status'; inline = $true }
+			$items += New-AttendanceItemResult -Kind 'Failed' -Identity $game.name -Reason 'InvalidResponse' -Detail 'Attendance status unavailable'
+			continue
+		}
 		if ($ret_info.retcode -eq -100) {
 			Out-Log -Level 'ERROR' -Message "Invalid cookie for $($game.name): $ltuid"
 			$Embed.fields += @{ 'name' = $game.name; 'value' = Format-Text -Text $ret_info.message; 'inline' = $true }
-			$any_ping = $true
+			$items += New-AttendanceItemResult -Kind 'Failed' -Identity $game.name -Reason 'AuthenticationFailed' -Detail 'Provider rejected or blocked attendance'
 			Continue
 		}
 
+		# Explicit provider status confirms already signed. Do not POST again.
+		if ($ret_info.data.is_sign -eq $true) {
+			$items += New-AttendanceItemResult -Kind 'AlreadySigned' -Identity $game.name
+			if (-not $IsReusing) {
+				$Embed.fields += @{ name = $game.name; value = 'Already signed today'; inline = $true }
+			}
+			continue
+		}
 		# 2. Perform sign-in
 		Out-Log -Level 'INFO' -Message "Checking $display_name in for $($game.name)"
 		$api_sign_url = "$base_url/event/$($game.game_id)/sign?lang=$($Config.lang)"
 		$sign_body = @{ 'act_id' = $act_id } | ConvertTo-Json
 		$ret_sign = Invoke-RestMethod -Method 'Post' -Uri $api_sign_url -Body $sign_body -Headers $api_headers -ContentType 'application/json;charset=UTF-8' -UserAgent $Config.user_agent -WebSession $session
-		Out-Log -Level 'DEBUG' -Message "Check-in result: $ret_sign"
+		Out-Log -Level 'DEBUG' -Message "Check-in result: $(Format-LogObject -InputObject $ret_sign)"
 
 		if ($ret_sign.retcode -eq -100) {
 			Out-Log -Level 'ERROR' -Message "Invalid cookie during sign for $($game.name): $ltuid"
 			$Embed.fields += @{ 'name' = $game.name; 'value' = Format-Text -Text $ret_sign.message; 'inline' = $true }
-			$any_ping = $true
+			$items += New-AttendanceItemResult -Kind 'Failed' -Identity $game.name -Reason 'AuthenticationFailed' -Detail 'Provider rejected or blocked attendance'
 			Continue
 		}
 
-		# 3. Handle Resign
-		if ($ret_info.data.sign_cnt_missed -gt 0 -and $ret_sign.retcode -ne -10002) {
-			Invoke-HoyolabResign -BaseUrl $base_url -GameId $game.game_id -ActId $act_id -Headers $api_headers -Jar $jar -Config $Config
+		# -10002 is the explicit already-signed response.
+		if ($ret_sign.retcode -eq -10002) {
+			$items += New-AttendanceItemResult -Kind 'AlreadySigned' -Identity $game.name
+			if (-not $IsReusing) {
+				$Embed.fields += @{ name = $game.name; value = 'Already signed today'; inline = $true }
+			}
+			continue
+		}
+		if ($ret_sign.data.gt_result -and -not ($ret_sign.data.gt_result.risk_code -eq 0 -and -not $ret_sign.data.gt_result.is_risk -and $ret_sign.data.gt_result.success -eq 0)) {
+			Out-Log -Level 'ERROR' -Message "Captcha required during attendance for $($game.name)"
+			$Embed.fields += @{ name = $game.name; value = $Config.discord_text.need_captcha; inline = $true }
+			$items += New-AttendanceItemResult -Kind 'Failed' -Identity $game.name -Reason 'CaptchaRequired'
+			continue
+		}
+		if ($null -eq $ret_sign -or $ret_sign.retcode -ne 0 -or $ret_sign.message -ne 'OK') {
+			Out-Log -Level 'ERROR' -Message "Provider did not confirm attendance for $($game.name)"
+			$Embed.fields += @{ name = $game.name; value = 'Check-in was not confirmed'; inline = $true }
+			$items += New-AttendanceItemResult -Kind 'Failed' -Identity $game.name -Reason 'CheckInUnconfirmed'
+			continue
 		}
 
-		# 4. Process sign-in outcome
-		$skip = $ret_info.data.is_sign -or $ret_sign.retcode -eq -10002
-		if ($skip) {
-			$msg = Format-Text -Text $ret_sign.message
-			Out-Log -Level 'INFO' -Message "[$display_name] $msg"
-			if ($ret_sign.retcode -eq -10002) { Continue }
-
-			# Only add to embed if not reusing message to avoid overwrite
-			if (-not $IsReusing) {
-				$Embed.fields += @{ 'name' = $game.name; 'value' = $msg; 'inline' = $true }
+		# Only POST confirmation establishes a Signed result. Reward display
+		# and re-sign are optional operations, not attendance confirmation.
+		$items += New-AttendanceItemResult -Kind 'Signed' -Identity $game.name
+		if ($ret_info.data.sign_cnt_missed -gt 0) {
+			try {
+				Invoke-HoyolabResign -BaseUrl $base_url -GameId $game.game_id -ActId $act_id -Headers $api_headers -Jar $jar -Config $Config
+			}
+			catch {
+				Out-Log -Level 'WARN' -Message "Optional HoYoLAB re-sign failed for $($game.name)."
 			}
 		}
-		elseif ($ret_sign.data.gt_result -and -not ($ret_sign.data.gt_result.risk_code -eq 0 -and -not $ret_sign.data.gt_result.is_risk -and $ret_sign.data.gt_result.success -eq 0)) {
-			Out-Log -Level 'ERROR' -Message "Captcha requested for $ltuid ($($game.name))"
-			$Embed.fields += @{ 'name' = $game.name; 'value' = $Config.discord_text.need_captcha; 'inline' = $true }
-			$any_ping = $true
-			Continue
+		try {
+			$updated = Invoke-RestMethod -Method 'Get' -Uri $api_info_url -Headers $api_headers -ContentType 'application/json;charset=UTF-8' -UserAgent $Config.user_agent -WebSession $session
+			$api_reward_url = "$base_url/event/$($game.game_id)/home?lang=$($Config.lang)&act_id=$act_id"
+			$ret_reward = Invoke-RestMethod -Method 'Get' -Uri $api_reward_url -Headers $api_headers -ContentType 'application/json;charset=UTF-8' -UserAgent $Config.user_agent -WebSession $session
+			if ($null -eq $updated -or $updated.retcode -ne 0 -or $null -eq $updated.data -or $null -eq $ret_reward -or $ret_reward.retcode -ne 0 -or $null -eq $ret_reward.data.awards) {
+				throw 'Reward information unavailable'
+			}
+			$rewardIndex = [int]$updated.data.total_sign_day - 1
+			if ($rewardIndex -lt 0 -or $rewardIndex -ge @($ret_reward.data.awards).Count) {
+				throw 'Reward index unavailable'
+			}
+			$current_reward = $ret_reward.data.awards[$rewardIndex]
+			if (-not $current_reward -or -not $current_reward.name) {
+				throw 'Reward entry unavailable'
+			}
+			$reward_name = Format-Text -Text $current_reward.name
+			$reward_text_full = "$($updated.data.today)`n**$($Config.discord_text.total_sign_day)**`n$($updated.data.total_sign_day)$($Config.discord_text.total_sign_day_unit)`n**$($Config.discord_text.reward)**`n$reward_name x$($current_reward.cnt)"
+			$reward_text_minimal = "$($updated.data.today) ($($updated.data.total_sign_day))`n$reward_name x$($current_reward.cnt)"
+			$Embed.fields += @{ name = $game.name; value = $reward_text_full; inline = $true; minimal = $reward_text_minimal }
 		}
-		elseif ($ret_sign.message -ne 'OK') {
-			Out-Log -Level 'ERROR' -Message "Unknown check-in error for ${ltuid}: $($ret_sign.message)"
-			Continue
+		catch {
+			Out-Log -Level 'WARN' -Message "Reward details unavailable after confirmed HoYoLAB attendance for $($game.name)."
+			$Embed.fields += @{ name = $game.name; value = 'Signed today; reward details unavailable'; inline = $true }
 		}
-		else {
-			# Success - get updated info
-			$ret_info = Invoke-RestMethod -Method 'Get' -Uri $api_info_url -Headers $api_headers -ContentType 'application/json;charset=UTF-8' -UserAgent $Config.user_agent -WebSession $session
-		}
-
-		# 5. Get Reward Info
-		$api_reward_url = "$base_url/event/$($game.game_id)/home?lang=$($Config.lang)&act_id=$act_id"
-		$ret_reward = Invoke-RestMethod -Method 'Get' -Uri $api_reward_url -Headers $api_headers -ContentType 'application/json;charset=UTF-8' -UserAgent $Config.user_agent -WebSession $session
-		if (($ret_info.retcode -eq -100) -or ($ret_reward.retcode -eq -100)) {
-			$Embed.fields += @{ 'name' = $game.name; 'value' = Format-Text -Text $ret_reward.message }
-			Continue
-		}
-
-		$current_reward = $ret_reward.data.awards[$ret_info.data.total_sign_day - 1]
-		$reward_name = Format-Text -Text $current_reward.name
-		Out-Log -Level 'INFO' -Message "[$display_name] $reward_name x$($current_reward.cnt)"
-
-		$Embed.color = '5635840' # Green (Success)
-		$reward_text_full = "$($ret_info.data.today)`n**$($Config.discord_text.total_sign_day)**`n$($ret_info.data.total_sign_day)$($Config.discord_text.total_sign_day_unit)`n**$($Config.discord_text.reward)**`n$reward_name x$($current_reward.cnt)"
-		$reward_text_minimal = "$($ret_info.data.today) ($($ret_info.data.total_sign_day))`n$reward_name x$($current_reward.cnt)"
-		
-		$Embed.fields += @{ 'name' = $game.name; 'value' = $reward_text_full; 'inline' = $true; 'minimal' = $reward_text_minimal }
 	}
 
-	return @{ NeedPing = $any_ping }
+	return Complete-AttendanceProfileResult -Platform 'hoyolab' -Items $items
 }
 
 function Invoke-HoyolabResign {

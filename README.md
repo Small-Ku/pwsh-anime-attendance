@@ -19,6 +19,15 @@ An auto attendance tool written in PowerShell, for online platforms like HoYoLAB
     - Custom User-Agent and language settings for different platforms.
 - **Auto Re-sign**: Automates tasks and re-signing for HoYoLAB.
 
+## Attendance Results and Alerts
+
+Results are evaluated per game, role, or task, then aggregated per profile:
+
+- **Success (green):** every applicable item was confirmed signed or already signed.
+- **PartialFailure (orange):** at least one item was confirmed and another failed.
+- **Failure (red):** no applicable item succeeded, authentication failed, or the provider returned unusable data.
+
+The Discord embed status and mention policy are derived from the aggregate result. A missing bound role, failed user lookup, invalid provider response, or unconfirmed check-in is never silently treated as success. When a failure is detected, message reuse does not preserve stale successful fields; when a profile recovers, previous error fields are cleared. If no Discord mention recipient is configured, the error embed still sends without an empty ping.
 ## Quick Start
 
 ### 1. Environment Requirements
@@ -48,7 +57,7 @@ Clone or download this repository to your local directory.
 2. Or log in to [Skland Web](https://www.skland.com/), open `https://web-api.skland.com/account/info/hg` and copy the `content` field value as token.
 3. In this project, put the token into `profiles[].token` for the `platform: "skland"` profile.
 
-Before exchanging that token for a Skland credential, the script follows the `skland-kit` flow and registers a synthetic device profile with Shumei (`fp-it.portal101.cn`). The validated `dId` returned by that service is required by current Skland device checks.
+The first local run automatically provisions and saves the Skland device state for that profile; no manual device ID or seed setup is required.
 
 ### 4. Run the Script
 Open PowerShell, navigate to the project directory, and execute:
@@ -60,7 +69,7 @@ Open PowerShell, navigate to the project directory, and execute:
 
 ### Discord Bot Configuration (`bots`)
 - `discord_name`: The display name of the bot.
-- `reuse_msg`: 
+- `reuse_msg`:
     - `false`: Send a new message every time.
     - `true`: Automatically record the ID after the first message and update it in subsequent runs.
     - `[Message ID]`: Manually specify the message ID to update.
@@ -72,6 +81,7 @@ Open PowerShell, navigate to the project directory, and execute:
 - HoYoLAB credentials: `ltoken`/`ltoken_v2` and related cookie fields.
 - Skport credentials: `cred` is required.
 - Skland credentials: `token` is required.
+- Skland device state is managed automatically per profile after the first successful run.
 - Fuhouse credentials: `cookies` (specifically `PHPSESSID` cookie) is required.
 - `console_name`: A custom name used for log display and bot matching.
 
@@ -86,3 +96,20 @@ You can use the built-in `sign_schedule.ps1` to automatically register a Windows
 ## Disclaimer
 
 This project is for educational and exchange purposes only. Please do not use it for any commercial purposes. The user assumes all responsibility for any account issues (such as bans or anomalies) caused by using this tool.
+
+## Console output and credential safety
+
+Use `"display": { "console": { "enabled": true, "redact": "always" } }` to show attendance progress and failures on the console. Masking remains enabled locally and in CI, including in debug output. Sensitive fields in API response logs and configured credentials (tokens, cookies, webhook URLs, device IDs and seeds) are redacted. `enabled: false` only silences console output; it does not make notifications more secure.
+
+Legacy `"console": false` and `"console": "pause"` are supported for compatibility. Pause is normalized into `runtime.pause`, independently from whether console messages are visible. Never copy raw console output containing new, unrecognized provider data into public reports.
+## Skport Endfield credential recovery
+
+Skport web credentials can expire independently of the token returned by the refresh API. A successful refresh response is not enough to prove that subsequent user/binding requests are authenticated. The checker now retries a rejected request after one refresh, reports persistent authentication failures instead of treating them as missing roles, and checks `hasToday` before sending a check-in POST.
+
+If the stored `profiles[].cred` is stale, save your own authenticated Skport browser HAR to your Windows computer (raw .har or .har.tar.zst) and run the local import helper:
+
+```powershell
+pwsh -File .\tools\Import-SkportCredentialFromHar.ps1 -HarArchivePath 'C:\path\to\game.skport.com_Archive.har' -ConfigPath .\sign.json
+```
+
+The helper selects a credential only from a confirmed HTTPS Endfield attendance response, verifies user and role access using read-only requests, and updates just the local `cred` field. It never prints credentials, and removes the temporary extracted HAR. **Do not commit, publish, or paste a raw HAR:** it contains session credentials.
