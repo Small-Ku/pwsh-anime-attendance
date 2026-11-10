@@ -103,7 +103,7 @@ function Invoke-FuhouseAttendance {
 
 	$cookieResult = Select-FuhouseCookie -Profile $Profiie
 	if (-not $cookieResult.IsValid) {
-		$logMsg = if ($Profiie.console_name) { $Profiie.console_name } else { "Unknown" }
+		$logMsg = Format-LogIdentity -Value $Profiie.console_name -Label 'console_name'
 		Out-Log -Level 'ERROR' -Message "Invalid cookie format for Fuhouse profile: $logMsg"
 		$Embed.title = "Fuhouse: $logMsg"
 		$Embed.fields += @{ 'name' = 'Error'; 'value' = $discordText.missing_cookie; 'inline' = $false }
@@ -153,7 +153,7 @@ function Invoke-FuhouseAttendance {
 	}
 
 	if ($uid -eq "Unknown" -or $displayName -eq "Unknown") {
-		$logMsg = if ($Profiie.console_name) { $Profiie.console_name } else { "Unknown" }
+		$logMsg = Format-LogIdentity -Value $Profiie.console_name -Label 'console_name'
 		Out-Log -Level 'ERROR' -Message "Session expired or invalid cookie for Fuhouse profile: $logMsg"
 		
 		$Embed.title = "Fuhouse: Session Expired"
@@ -162,6 +162,8 @@ function Invoke-FuhouseAttendance {
 		return New-AttendanceProfileFailure -Platform 'fuhouse' -Reason 'AuthenticationFailed' -Message 'Fuhouse account validation failed'
 	}
 
+	$logDisplayName = Format-LogIdentity -Value $displayName -Label 'account' -Key $uid
+	Register-LogSecret -Secret $displayName -Label 'nickname'
 	Register-LogSecret -Secret $uid -Label 'uid'
 	Register-GitHubLogMasks
 	$Embed.title = "Fuhouse: $displayName"
@@ -170,29 +172,29 @@ function Invoke-FuhouseAttendance {
 	} else {
 		$Embed.description = ""
 	}
-	Out-Log -Level 'INFO' -Message "Checking $displayName in for Fuhouse"
+	Out-Log -Level 'INFO' -Message "Checking $logDisplayName in for Fuhouse"
 
 	# 2. Perform daily sign-in
 	$signInMsg = ""
 	$signKind = 'Failed'
 	try {
 		$signInResult = Invoke-FuhouseRequest -Uri "$baseUrl/home/Api/signupNew.html" -Body "td=&auto=true&type=1&autoSign=false" -Headers $headers -UserAgent $userAgent -Session $session
-		Out-Log -Level 'DEBUG' -Message "[$displayName] Sign-in response: $(Format-LogObject -InputObject $signInResult)"
+		Out-Log -Level 'DEBUG' -Message "[$logDisplayName] Sign-in response: $(Format-LogObject -InputObject $signInResult)"
 		
 		if ($signInResult.code -eq 2000 -or $signInResult.code -eq 400) {
 			$signKind = if ($signInResult.code -eq 400) { 'AlreadySigned' } else { 'Signed' }
 			$signInMsg = $signInResult.msg
-			Out-Log -Level 'INFO' -Message "[$displayName] $signInMsg"
+			Out-Log -Level 'INFO' -Message "[$logDisplayName] $signInMsg"
 		}
 		else {
 			$signInMsg = if ($signInResult.msg) { $signInResult.msg } else { $discordText.sign_in_failed -f $signInResult.code }
-			Out-Log -Level 'ERROR' -Message "[$displayName] $signInMsg"
+			Out-Log -Level 'ERROR' -Message "[$logDisplayName] $signInMsg"
 		}
 	}
 	catch {
 		$err = $_
 		$signInMsg = $discordText.connection_failed -f $err.Exception.Message
-		Out-Log -Level 'ERROR' -Message "[$displayName] Sign-in exception: $($err.Exception.Message)"
+		Out-Log -Level 'ERROR' -Message "[$logDisplayName] Sign-in exception: $($err.Exception.Message)"
 	}
 
 	$Embed.fields += @{ 'name' = $discordText.daily_sign_in; 'value' = $signInMsg; 'inline' = $true }
@@ -206,22 +208,22 @@ function Invoke-FuhouseAttendance {
 	# 3. Perform Ads Task (taskid=1)
 	$adsMsg = ""
 	$adsClaimState = 'Failed'
-	Out-Log -Level 'INFO' -Message "[$displayName] Checking $($discordText.ads_task) status..."
+	Out-Log -Level 'INFO' -Message "[$logDisplayName] Checking $($discordText.ads_task) status..."
 	try {
 		$claimAds = Invoke-FuhouseRequest -Uri "$baseUrl/home/signup/completetask" -Body "taskid=1" -Headers $headers -UserAgent $userAgent -Session $session
 		$adsClaimState = Get-FuhouseTaskClaimState -Response $claimAds
 		if ($adsClaimState -eq 'AlreadyClaimed') {
 			$adsMsg = $claimAds.msg
-			Out-Log -Level 'INFO' -Message "[$displayName] $($discordText.ads_task): $adsMsg (Skipped execution)"
+			Out-Log -Level 'INFO' -Message "[$logDisplayName] $($discordText.ads_task): $adsMsg (Skipped execution)"
 		}
 		elseif ($adsClaimState -eq 'Claimed') {
 			$adsMsg = $claimAds.msg
-			Out-Log -Level 'INFO' -Message "[$displayName] $($discordText.ads_task): $adsMsg (Claimed successfully)"
+			Out-Log -Level 'INFO' -Message "[$logDisplayName] $($discordText.ads_task): $adsMsg (Claimed successfully)"
 		}
 		else {
-			Out-Log -Level 'INFO' -Message "[$displayName] Executing $($discordText.ads_task) (Task 1)..."
+			Out-Log -Level 'INFO' -Message "[$logDisplayName] Executing $($discordText.ads_task) (Task 1)..."
 			for ($i = 1; $i -le 5; $i++) {
-				Out-Log -Level 'DEBUG' -Message "[$displayName] Triggering $($discordText.ads_task) ($i/5)"
+				Out-Log -Level 'DEBUG' -Message "[$logDisplayName] Triggering $($discordText.ads_task) ($i/5)"
 				$null = Invoke-FuhouseRequest -Uri "$baseUrl/home/signup/recads" -Body "taskid=1" -Headers $headers -UserAgent $userAgent -Session $session
 				Start-Sleep -Seconds 1
 			}
@@ -230,18 +232,18 @@ function Invoke-FuhouseAttendance {
 			$adsClaimState = Get-FuhouseTaskClaimState -Response $claimAds
 			if ($adsClaimState -eq 'Claimed' -or $adsClaimState -eq 'AlreadyClaimed') {
 				$adsMsg = $claimAds.msg
-				Out-Log -Level 'INFO' -Message "[$displayName] $($discordText.ads_task): $adsMsg"
+				Out-Log -Level 'INFO' -Message "[$logDisplayName] $($discordText.ads_task): $adsMsg"
 			}
 			else {
 				$adsMsg = if ($claimAds.msg) { $claimAds.msg } else { $discordText.ads_task_claim_failed -f $claimAds.code }
-				Out-Log -Level 'WARN' -Message "[$displayName] $($discordText.ads_task): $adsMsg"
+				Out-Log -Level 'WARN' -Message "[$logDisplayName] $($discordText.ads_task): $adsMsg"
 			}
 		}
 	}
 	catch {
 		$err = $_
 		$adsMsg = $discordText.connection_failed -f $err.Exception.Message
-		Out-Log -Level 'ERROR' -Message "[$displayName] Ads Task exception: $($err.Exception.Message)"
+		Out-Log -Level 'ERROR' -Message "[$logDisplayName] Ads Task exception: $($err.Exception.Message)"
 	}
 
 	$Embed.fields += @{ 'name' = $discordText.ads_task; 'value' = $adsMsg; 'inline' = $true }
@@ -255,20 +257,20 @@ function Invoke-FuhouseAttendance {
 	# 4. Perform Reading Task (taskid=2)
 	$readingMsg = ""
 	$readingClaimState = 'Failed'
-	Out-Log -Level 'INFO' -Message "[$displayName] Checking $($discordText.reading_task) status..."
+	Out-Log -Level 'INFO' -Message "[$logDisplayName] Checking $($discordText.reading_task) status..."
 	try {
 		$claimReading = Invoke-FuhouseRequest -Uri "$baseUrl/home/signup/completetask" -Body "taskid=2" -Headers $headers -UserAgent $userAgent -Session $session
 		$readingClaimState = Get-FuhouseTaskClaimState -Response $claimReading
 		if ($readingClaimState -eq 'AlreadyClaimed') {
 			$readingMsg = $claimReading.msg
-			Out-Log -Level 'INFO' -Message "[$displayName] $($discordText.reading_task): $readingMsg (Skipped execution)"
+			Out-Log -Level 'INFO' -Message "[$logDisplayName] $($discordText.reading_task): $readingMsg (Skipped execution)"
 		}
 		elseif ($readingClaimState -eq 'Claimed') {
 			$readingMsg = $claimReading.msg
-			Out-Log -Level 'INFO' -Message "[$displayName] $($discordText.reading_task): $readingMsg (Claimed successfully)"
+			Out-Log -Level 'INFO' -Message "[$logDisplayName] $($discordText.reading_task): $readingMsg (Claimed successfully)"
 		}
 		else {
-			Out-Log -Level 'INFO' -Message "[$displayName] Executing $($discordText.reading_task) (Task 2)..."
+			Out-Log -Level 'INFO' -Message "[$logDisplayName] Executing $($discordText.reading_task) (Task 2)..."
 			# Get daily updated books via API
 			$dailyRes = Invoke-FuhouseRequest -Uri "$baseUrl/home/Api/getDailyUpdate.html" -Method 'Post' -Body "widx=11&limit=18&page=0&lastpage=" -Headers $headers -UserAgent $userAgent -Session $session
 			
@@ -283,7 +285,7 @@ function Invoke-FuhouseAttendance {
 			
 			# If API didn't return books, fallback to parsing static page
 			if ($bookIds.Count -eq 0) {
-				Out-Log -Level 'WARN' -Message "[$displayName] No books found via API, trying fallback parsing..."
+				Out-Log -Level 'WARN' -Message "[$logDisplayName] No books found via API, trying fallback parsing..."
 				$dailyHtml = Invoke-FuhouseRequest -Uri "$baseUrl/home/index/dailyupdate1" -Method 'Get' -Headers $headers -UserAgent $userAgent -Session $session
 				$matches = [regex]::Matches($dailyHtml, '/home/book/index/id/(\d+)')
 				foreach ($m in $matches) {
@@ -300,7 +302,7 @@ function Invoke-FuhouseAttendance {
 				}
 				
 				$bookUrl = "$baseUrl/home/book/index/id/$bookId"
-				Out-Log -Level 'DEBUG' -Message "[$displayName] Fetching book detail to get chapters: $bookUrl"
+				Out-Log -Level 'DEBUG' -Message "[$logDisplayName] Fetching book detail to get chapters: $bookUrl"
 				try {
 					$bookHtml = Invoke-FuhouseRequest -Uri $bookUrl -Method 'Get' -Headers $headers -UserAgent $userAgent -Session $session
 					# Parse chapter IDs from embedded JSON list
@@ -320,13 +322,13 @@ function Invoke-FuhouseAttendance {
 					}
 				}
 				catch {
-					Out-Log -Level 'WARN' -Message "[$displayName] Failed to fetch chapters for book ($bookId) - $($_.Exception.Message)"
+					Out-Log -Level 'WARN' -Message "[$logDisplayName] Failed to fetch chapters for book ($bookId) - $($_.Exception.Message)"
 				}
 			}
 
 			if ($chaptersToRead.Count -eq 0) {
 				$readingMsg = $discordText.no_available_chapters
-				Out-Log -Level 'ERROR' -Message "[$displayName] $($discordText.reading_task): $readingMsg"
+				Out-Log -Level 'ERROR' -Message "[$logDisplayName] $($discordText.reading_task): $readingMsg"
 			}
 			else {
 				$readSuccess = 0
@@ -336,33 +338,33 @@ function Invoke-FuhouseAttendance {
 					$bookId = $task.bookId
 					$chapterId = $task.chapterId
 					$chapterUrl = "$baseUrl/home/book/capter/id/$chapterId"
-					Out-Log -Level 'INFO' -Message "[$displayName] Reading chapter ($($i+1)/$readCount): ID $chapterId (Book $bookId)"
+					Out-Log -Level 'INFO' -Message "[$logDisplayName] Reading chapter ($($i+1)/$readCount): ID $chapterId (Book $bookId)"
 
 					# Fetch chapter page to trigger any potential cookies/headers setup
 					$null = Invoke-FuhouseRequest -Uri $chapterUrl -Method 'Get' -Headers $headers -UserAgent $userAgent -Session $session
 
-					Out-Log -Level 'INFO' -Message "[$displayName] Waiting 10 seconds to satisfy reading duration..."
+					Out-Log -Level 'INFO' -Message "[$logDisplayName] Waiting 10 seconds to satisfy reading duration..."
 					Start-Sleep -Seconds 10
 
 					$readRes = Invoke-FuhouseRequest -Uri "$baseUrl/home/book/update_read_count" -Body "bookId=$bookId&chapterId=$chapterId" -Headers $headers -UserAgent $userAgent -Session $session
 					$readResStr = "$readRes"
-					Out-Log -Level 'DEBUG' -Message "[$displayName] Update read count response: $readResStr"
+					Out-Log -Level 'DEBUG' -Message "[$logDisplayName] Update read count response: $readResStr"
 					if ($readResStr -match '^\d+$' -or $readResStr -eq "success") {
 						$readSuccess++
 					}
 				}
 
-				Out-Log -Level 'DEBUG' -Message "[$displayName] Completed reading $readSuccess/5 chapters."
+				Out-Log -Level 'DEBUG' -Message "[$logDisplayName] Completed reading $readSuccess/5 chapters."
 				
 				$claimReading = Invoke-FuhouseRequest -Uri "$baseUrl/home/signup/completetask" -Body "taskid=2" -Headers $headers -UserAgent $userAgent -Session $session
 				$readingClaimState = Get-FuhouseTaskClaimState -Response $claimReading
 				if ($readingClaimState -eq 'Claimed' -or $readingClaimState -eq 'AlreadyClaimed') {
 					$readingMsg = $claimReading.msg
-					Out-Log -Level 'INFO' -Message "[$displayName] $($discordText.reading_task): $readingMsg"
+					Out-Log -Level 'INFO' -Message "[$logDisplayName] $($discordText.reading_task): $readingMsg"
 				}
 				else {
 					$readingMsg = if ($claimReading.msg) { $claimReading.msg } else { $discordText.reading_task_claim_failed -f $claimReading.code }
-					Out-Log -Level 'WARN' -Message "[$displayName] $($discordText.reading_task): $readingMsg"
+					Out-Log -Level 'WARN' -Message "[$logDisplayName] $($discordText.reading_task): $readingMsg"
 				}
 			}
 		}
@@ -370,7 +372,7 @@ function Invoke-FuhouseAttendance {
 	catch {
 		$err = $_
 		$readingMsg = $discordText.connection_failed -f $err.Exception.Message
-		Out-Log -Level 'ERROR' -Message "[$displayName] Reading Task exception: $($err.Exception.Message)"
+		Out-Log -Level 'ERROR' -Message "[$logDisplayName] Reading Task exception: $($err.Exception.Message)"
 	}
 
 	$Embed.fields += @{ 'name' = $discordText.reading_task; 'value' = $readingMsg; 'inline' = $true }

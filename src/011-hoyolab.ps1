@@ -57,6 +57,15 @@ function Get-HoyolabAccountInfo {
 	$uri = $Config.account.api_base + '/auth/api/getUserAccountInfoByLToken'
 	$ret = Invoke-RestMethod -Method 'Get' -Uri $uri -Headers $headers -ContentType 'application/json;charset=UTF-8' -UserAgent $Config.user_agent -WebSession $session
 
+	if ($ret.data) {
+		foreach ($field in @(
+			@{ Name = 'account_name'; Value = $ret.data.account_name },
+			@{ Name = 'email'; Value = $ret.data.email },
+			@{ Name = 'mobile'; Value = $ret.data.mobile }
+		)) {
+			Register-LogSecret -Secret $field.Value -Label $field.Name
+		}
+	}
 	Out-Log -Level 'DEBUG' -Message "Account info: $(Format-LogObject -InputObject $ret)"
 
 	if ($ret.retcode -eq 0) {
@@ -77,7 +86,7 @@ function Invoke-HoyolabCheckin {
 
 	$cookieResult = Select-HoyolabCookie -Profiie $Profiie
 	if (-not $cookieResult.IsValid) {
-		$logMsg = if ($Profiie.console_name) { $Profiie.console_name } else { "Unknown" }
+		$logMsg = Format-LogIdentity -Value $Profiie.console_name -Label 'console_name'
 		Out-Log -Level 'ERROR' -Message "Invalid cookie format for profile: $logMsg"
 		return New-AttendanceProfileFailure -Platform 'hoyolab' -Reason 'AuthenticationFailed' -Message 'Missing or rejected credentials'
 	}
@@ -87,6 +96,7 @@ function Invoke-HoyolabCheckin {
 	$ltuid = $cookieResult.ltuid
 	if ($ltuid -and $ltuid -ne 'Unknown') { Register-LogSecret -Secret $ltuid -Label 'ltuid'; Register-GitHubLogMasks }
 
+	$logLtuid = Format-LogIdentity -Value $ltuid -Label 'account' -Key $ltuid
 	$display_name = $ltuid -replace '^(\d{2})\d+(\d{2})$', '$1****$2'
 	$Embed.title = $display_name -replace '\*', '\*'
 	if ($ltuid -ne "Unknown") { $Embed.description = "ID: ||$ltuid||" }
@@ -95,11 +105,12 @@ function Invoke-HoyolabCheckin {
 	$ac_info = Get-HoyolabAccountInfo -Cookies $jar -Config $Config
 	if ($ac_info.Success -and $ac_info.DisplayName) {
 		$display_name = $ac_info.DisplayName
+		Register-LogSecret -Secret $display_name -Label 'display_name'
 		$Embed.title = $display_name -replace '\*', '\*'
 	}
 	elseif (-not $ac_info.Success) {
 		$Embed.fields += @{ 'name' = 'Account'; 'value' = $ac_info.Message }
-		Out-Log -Level 'ERROR' -Message "Failed to get account info for ${ltuid}: $($ac_info.Message)"
+		Out-Log -Level 'ERROR' -Message "Failed to get account info for ${logLtuid}: $($ac_info.Message)"
 		$items += New-AttendanceItemResult -Kind 'Failed' -Identity 'Account' -Reason 'AccountLookupFailed' -Detail 'Account information unavailable'
 		if ($ac_info.Message -match "login" -or $ac_info.Message -match "cookie") {
 			return New-AttendanceProfileFailure -Platform 'hoyolab' -Reason 'AuthenticationFailed' -Message 'Missing or rejected credentials'
@@ -142,7 +153,7 @@ function Invoke-HoyolabCheckin {
 			continue
 		}
 		if ($ret_info.retcode -eq -100) {
-			Out-Log -Level 'ERROR' -Message "Invalid cookie for $($game.name): $ltuid"
+			Out-Log -Level 'ERROR' -Message "Invalid cookie for $($game.name): $logLtuid"
 			$Embed.fields += @{ 'name' = $game.name; 'value' = Format-Text -Text $ret_info.message; 'inline' = $true }
 			$items += New-AttendanceItemResult -Kind 'Failed' -Identity $game.name -Reason 'AuthenticationFailed' -Detail 'Provider rejected or blocked attendance'
 			Continue
@@ -157,14 +168,14 @@ function Invoke-HoyolabCheckin {
 			continue
 		}
 		# 2. Perform sign-in
-		Out-Log -Level 'INFO' -Message "Checking $display_name in for $($game.name)"
+		Out-Log -Level 'INFO' -Message "Checking $(Format-LogIdentity -Value $display_name -Label 'account' -Key $ltuid) in for $($game.name)"
 		$api_sign_url = "$base_url/event/$($game.game_id)/sign?lang=$($Config.lang)"
 		$sign_body = @{ 'act_id' = $act_id } | ConvertTo-Json
 		$ret_sign = Invoke-RestMethod -Method 'Post' -Uri $api_sign_url -Body $sign_body -Headers $api_headers -ContentType 'application/json;charset=UTF-8' -UserAgent $Config.user_agent -WebSession $session
 		Out-Log -Level 'DEBUG' -Message "Check-in result: $(Format-LogObject -InputObject $ret_sign)"
 
 		if ($ret_sign.retcode -eq -100) {
-			Out-Log -Level 'ERROR' -Message "Invalid cookie during sign for $($game.name): $ltuid"
+			Out-Log -Level 'ERROR' -Message "Invalid cookie during sign for $($game.name): $logLtuid"
 			$Embed.fields += @{ 'name' = $game.name; 'value' = Format-Text -Text $ret_sign.message; 'inline' = $true }
 			$items += New-AttendanceItemResult -Kind 'Failed' -Identity $game.name -Reason 'AuthenticationFailed' -Detail 'Provider rejected or blocked attendance'
 			Continue

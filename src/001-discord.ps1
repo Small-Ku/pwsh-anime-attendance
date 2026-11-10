@@ -215,7 +215,7 @@ function Send-DiscordNotification {
 
 	$discord_body_json = $discord_body | ConvertTo-Json -Depth 10
 
-	Out-Log -Level 'DEBUG' -Message "Discord message body for bot $($BotConfig.discord_name):`n$(Format-LogObject -InputObject $discord_body)"
+	Out-Log -Level 'DEBUG' -Message "Discord message body for bot $(Format-LogIdentity -Value $BotConfig.discord_name -Label 'discord_name'):`n$(Format-LogObject -InputObject $discord_body)"
 
 	if ($reuse_id -and $reuse_id -match '^\d{18,}$') {
 		$uri = "$($BotConfig.webhook_url)/messages/$reuse_id"

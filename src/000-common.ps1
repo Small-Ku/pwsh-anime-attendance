@@ -185,6 +185,50 @@ function Test-LogRedactionEnabled {
 	return $true
 }
 
+function Test-LogCredentialLabel {
+	param([string]$Label)
+
+	# GitHub's add-mask applies a GLOBAL substring replacement, even to filenames,
+	# counters and unrelated HTTP codes. Only credentials belong in that list.
+	return $Label -in @(
+		'secret', 'token', 'access_token', 'refresh_token', 'authorization',
+		'cred', 'ltoken', 'ltoken_v2', 'ltmid_v2', 'cookies', 'cookie',
+		'set-cookie', 'webhook_url', 'password', 'passphrase', 'api_key',
+		'client_secret', 'device.seed', 'seed'
+	)
+}
+
+function Test-LogIdentityLabel {
+	param([string]$Label)
+
+	return $Label -in @(
+		'username', 'user_name', 'nickname', 'account_name',
+		'display_name', 'console_name', 'discord_name', 'email', 'mobile', 'phone'
+	)
+}
+
+function Get-LogIdentifierKeyPattern {
+	param([string]$Label)
+
+	$names = switch ($Label) {
+		'role_id' { 'role(?:_?id)?'; break }
+		'server_id' { 'server_?id'; break }
+		'game_id' { 'game_?id'; break }
+		'uid' { 'uid'; break }
+		'ltuid' { 'ltuid'; break }
+		'ltuid_v2' { 'ltuid_?v2'; break }
+		'id' { 'id'; break }
+		'device.id' { '(?:device[._]?id|dId)'; break }
+		'device.did' { '(?:device[._]?did|dId)'; break }
+		'user_id' { 'user_?id'; break }
+		'player_id' { 'player_?id'; break }
+		'account_id' { 'account_?id'; break }
+		'channelMasterId' { 'channel_?master_?id'; break }
+		'identity_key' { 'identity_?key'; break }
+		default { [regex]::Escape($Label); break }
+	}
+	return '(?i)(?<![A-Za-z0-9_])(?:' + $names + ')\s*[:=]\s*'
+}
 function Register-LogSecret {
 	param(
 		$Secret,
@@ -198,8 +242,13 @@ function Register-LogSecret {
 		$script:LogSecrets += $secretText
 	}
 	if ($null -eq $script:LogSecretLabels) { $script:LogSecretLabels = @{} }
-	if (-not $script:LogSecretLabels.ContainsKey($secretText)) {
-		$script:LogSecretLabels[$secretText] = if ([string]::IsNullOrWhiteSpace($Label)) { 'secret' } else { $Label }
+	$safeLabel = if ([string]::IsNullOrWhiteSpace($Label)) { 'secret' } else { $Label }
+	if (-not $script:LogSecretLabels.ContainsKey($secretText) -or
+		((Test-LogCredentialLabel -Label $safeLabel) -and
+		-not (Test-LogCredentialLabel -Label $script:LogSecretLabels[$secretText]))) {
+		# Same value may appear first as an ID and later as an auth credential.
+		# A credential label must take precedence for masking.
+		$script:LogSecretLabels[$secretText] = $safeLabel
 	}
 }
 
@@ -209,10 +258,15 @@ function Register-LogSecretsFromConfig {
 	$script:LogSecrets = @()
 	$script:LogSecretLabels = @{}
 	$script:GitHubMaskedLogSecrets = @{}
+	$script:LogIdentityAliases = @{}
+	$script:LogIdentityCounts = @{}
 	if ($null -eq $Config) { return }
 
 	foreach ($profile in @((Get-AnimeAttendanceProperty -Object $Config -Name 'profiles'))) {
 		foreach ($name in @('ltoken', 'ltoken_v2', 'ltmid_v2', 'ltuid', 'ltuid_v2', 'cred', 'token', 'cookies')) {
+			Register-LogSecret -Secret (Get-AnimeAttendanceProperty -Object $profile -Name $name) -Label $name
+		}
+		foreach ($name in @('console_name', 'username', 'nickname', 'account_name', 'email', 'phone', 'mobile')) {
 			Register-LogSecret -Secret (Get-AnimeAttendanceProperty -Object $profile -Name $name) -Label $name
 		}
 		$device = Get-AnimeAttendanceProperty -Object $profile -Name 'device'
@@ -232,6 +286,7 @@ function Register-LogSecretsFromConfig {
 	$discord = Get-AnimeAttendanceProperty -Object $display -Name 'discord'
 	foreach ($bot in @((Get-AnimeAttendanceProperty -Object $discord -Name 'bots'))) {
 		Register-LogSecret -Secret (Get-AnimeAttendanceProperty -Object $bot -Name 'webhook_url') -Label 'webhook_url'
+		Register-LogSecret -Secret (Get-AnimeAttendanceProperty -Object $bot -Name 'discord_name') -Label 'discord_name'
 	}
 	Register-GitHubLogMasks
 }
@@ -244,6 +299,29 @@ function Get-LogRedactionMarker {
 	return "***REDACTED:$safeLabel***"
 }
 
+function Format-LogIdentity {
+	param(
+		$Value,
+		[string]$Label = 'identity',
+		[string]$Key
+	)
+
+	# Identity is known at this call site. Issue an opaque, per-run ordinal,
+	# not a content-derived hash or a GitHub global add-mask operation.
+	if ([string]::IsNullOrWhiteSpace([string]$Value)) { return 'Unknown' }
+	if ($null -eq $script:LogIdentityAliases) { $script:LogIdentityAliases = @{} }
+	if ($null -eq $script:LogIdentityCounts) { $script:LogIdentityCounts = @{} }
+	$scope = if ([string]::IsNullOrWhiteSpace($Label)) { 'identity' } else { $Label -replace '[^A-Za-z0-9_.-]', '_' }
+	$identity = if ([string]::IsNullOrWhiteSpace($Key)) { [string]$Value } else { $Key }
+	$mapKey = $scope + [char]0 + $identity
+	if (-not $script:LogIdentityAliases.ContainsKey($mapKey)) {
+		$ordinal = 1
+		if ($script:LogIdentityCounts.ContainsKey($scope)) { $ordinal = [int]$script:LogIdentityCounts[$scope] + 1 }
+		$script:LogIdentityCounts[$scope] = $ordinal
+		$script:LogIdentityAliases[$mapKey] = Get-LogRedactionMarker -Label ("{0}-{1}" -f $scope, $ordinal)
+	}
+	return [string]$script:LogIdentityAliases[$mapKey]
+}
 function Protect-GitHubCommandValue {
 	param([string]$Value)
 
@@ -252,10 +330,16 @@ function Protect-GitHubCommandValue {
 }
 
 function Register-GitHubLogMask {
-	param([string]$Secret)
+	param(
+		[string]$Secret,
+		[string]$Label = 'secret'
+	)
 
 	if (-not (Test-AnimeAttendanceGitHubActions) -or -not (Test-LogRedactionEnabled)) { return }
 	if ([string]::IsNullOrWhiteSpace($Secret)) { return }
+	# Do not register identifiers or tiny values with GitHub's global substring masker.
+	# Local Out-Log masking and key-aware JSON redaction still apply.
+	if (-not (Test-LogCredentialLabel -Label $Label) -or $Secret.Length -lt 8 -or $Secret -match '\s') { return }
 	if ($null -eq $script:GitHubMaskedLogSecrets) { $script:GitHubMaskedLogSecrets = @{} }
 	if ($script:GitHubMaskedLogSecrets.ContainsKey($Secret)) { return }
 	$script:GitHubMaskedLogSecrets[$Secret] = $true
@@ -266,7 +350,8 @@ function Register-GitHubLogMask {
 function Register-GitHubLogMasks {
 	if (-not (Test-AnimeAttendanceGitHubActions) -or -not (Test-LogRedactionEnabled)) { return }
 	foreach ($secret in @($script:LogSecrets)) {
-		Register-GitHubLogMask -Secret ([string]$secret)
+		$label = if ($script:LogSecretLabels.ContainsKey([string]$secret)) { [string]$script:LogSecretLabels[[string]$secret] } else { 'secret' }
+		Register-GitHubLogMask -Secret ([string]$secret) -Label $label
 	}
 }
 
@@ -275,19 +360,62 @@ function Protect-LogMessage {
 
 	if (-not (Test-LogRedactionEnabled)) { return $Message }
 	$protected = if ($null -eq $Message) { '' } else { [string]$Message }
+	# Typed aliases are already safe. Protect them from a later fallback match
+	# (for example, an account literally named "role" or "username").
+	$markers = @{}
+	$protected = [regex]::Replace($protected, '\*{3}REDACTED:[A-Za-z0-9_.-]+\*{3}', [System.Text.RegularExpressions.MatchEvaluator] {
+		param($match)
+		$placeholder = [string][char](0xE000 + $markers.Count)
+		$markers[$placeholder] = $match.Value
+		return $placeholder
+	})
 	$secrets = @($script:LogSecrets | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Sort-Object Length -Descending)
 	foreach ($secret in $secrets) {
-		$label = if ($script:LogSecretLabels.ContainsKey([string]$secret)) { $script:LogSecretLabels[[string]$secret] } else { 'secret' }
+		$label = if ($script:LogSecretLabels.ContainsKey([string]$secret)) { [string]$script:LogSecretLabels[[string]$secret] } else { 'secret' }
 		$secretText = [string]$secret
 		$marker = Get-LogRedactionMarker -Label $label
-		if ($secretText.Length -lt 6) {
-			# Short role IDs may otherwise corrupt status codes such as 1001.
-			$pattern = '(?<![A-Za-z0-9-])' + [regex]::Escape($secretText) + '(?![A-Za-z0-9])'
+		if (Test-LogCredentialLabel -Label $label) {
+			if ($secretText.Length -ge 6) {
+				$protected = $protected.Replace($secretText, $marker)
+			}
+			else {
+				# Tiny credentials are masked only when explicitly named, never everywhere.
+				$key = '(?i)(?<![A-Za-z0-9_])(?:token|cred|cookie|secret|password|key|authorization)\s*[:=]\s*'
+				$pattern = '(' + $key + ')' + [regex]::Escape($secretText) + '(?![A-Za-z0-9])'
+				$protected = [regex]::Replace($protected, $pattern, [System.Text.RegularExpressions.MatchEvaluator] {
+					param($match)
+					return $match.Groups[1].Value + $marker
+				})
+			}
+		}
+		elseif (Test-LogIdentityLabel -Label $label) {
+			# Names are identity data even when they are not passwords.
+			# Restrict replacement to a complete name token so a short name does
+			# not corrupt filenames or unrelated words via substring masking.
+			$pattern = '(?<![\p{L}\p{N}_/\\])' + [regex]::Escape($secretText) + '(?![\p{L}\p{N}_./\\])'
 			$protected = [regex]::Replace($protected, $pattern, $marker)
 		}
 		else {
-			$protected = $protected.Replace($secretText, $marker)
+			# Identifier numbers are not authentication secrets. Short ones may be
+			# ordinary profile indices, counts, error codes, or filenames.
+			$key = Get-LogIdentifierKeyPattern -Label $label
+			$pattern = '(' + $key + ')' + [regex]::Escape($secretText) + '(?![A-Za-z0-9_.-])'
+			$protected = [regex]::Replace($protected, $pattern, [System.Text.RegularExpressions.MatchEvaluator] {
+				param($match)
+				return $match.Groups[1].Value + $marker
+			})
+			if ($secretText.Length -ge 6) {
+				$pattern = '(?<![A-Za-z0-9_.-])' + [regex]::Escape($secretText) + '(?![A-Za-z0-9_.-])'
+				$protected = [regex]::Replace($protected, $pattern, $marker)
+			}
 		}
+	}
+	# Account email addresses may be generated from API responses rather than
+	# from configuration and therefore never enter the known-secret registry.
+	$emailPattern = '(?i)(?<![A-Za-z0-9._%+\-])[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}(?![A-Za-z0-9.\-])'
+	$protected = [regex]::Replace($protected, $emailPattern, '***REDACTED:email***')
+	foreach ($placeholder in $markers.Keys) {
+		$protected = $protected.Replace([string]$placeholder, [string]$markers[$placeholder])
 	}
 	return $protected
 }
@@ -318,6 +446,17 @@ function Get-LogSensitiveKeyLabel {
 		'id' { return 'id' }
 		'uid' { return 'uid' }
 		'accountid' { return 'account_id' }
+		'accountname' { return 'account_name' }
+		'username' { return 'username' }
+		'nickname' { return 'nickname' }
+		'displayname' { return 'display_name' }
+		'consolename' { return 'console_name' }
+		'discordname' { return 'discord_name' }
+		'email' { return 'email' }
+		'emailaddress' { return 'email' }
+		'mobile' { return 'mobile' }
+		'phone' { return 'phone' }
+		'phonenumber' { return 'phone' }
 		'userid' { return 'user_id' }
 		'playerid' { return 'player_id' }
 		'roleid' { return 'role_id' }

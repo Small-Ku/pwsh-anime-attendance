@@ -829,6 +829,7 @@ function Invoke-SkAttendanceCore {
 		$Embed.fields += @{ name = $Provider; value = 'User response missing required identity'; inline = $false }
 		return New-AttendanceProfileFailure -Platform $Provider -Reason 'InvalidResponse' -Message 'User response missing required identity'
 	}
+	Register-LogSecret -Secret $nickname -Label 'nickname'
 	Register-LogSecret -Secret $userId -Label 'id'
 	Register-GitHubLogMasks
 	$Embed.title = if ($nickname) { Format-Text -Text $nickname } else { "Unknown $Provider User" }
@@ -860,6 +861,7 @@ function Invoke-SkAttendanceCore {
 		)) {
 			Register-LogSecret -Secret $field.Value -Label $field.Name
 		}
+		Register-LogSecret -Secret $role.nickname -Label 'nickname'
 		Register-LogSecret -Secret (Get-SkFieldKey -Role $role) -Label 'identity_key'
 	}
 	Register-GitHubLogMasks
@@ -873,6 +875,8 @@ function Invoke-SkAttendanceCore {
 
 		$ident = Build-SkIdentity -Role $role -Game $game
 		$fieldKey = Get-SkFieldKey -Role $role
+		$logRole = Format-LogIdentity -Value $ident.nickname -Label 'role' -Key $fieldKey
+		$logIdentity = if ($ident.server_name) { "$($ident.server_name) - $logRole" } else { $logRole }
 		$ep = Resolve-SkAttendanceEndpoints -Ctx $roleCtx -Role $role
 		$postPath = $ep.post.Replace('{app_code}', $game.app_code)
 		$getPath = $ep.get.Replace('{app_code}', $game.app_code)
@@ -885,13 +889,13 @@ function Invoke-SkAttendanceCore {
 		if ($Provider -eq 'skport') {
 			# Skport exposes a reliable "hasToday" status. Check before POST:
 			# it avoids duplicate writes and refuses to sign if status/auth is unknown.
-			Out-Log -Level 'INFO' -Message "Checking status for $($ident.identity) ($($ident.title))"
+			Out-Log -Level 'INFO' -Message "Checking status for $logIdentity ($($ident.title))"
 			$resGet = Invoke-SkAuthorizedApiRequest -Method 'Get' -Path $getPath -Ctx $roleCtx -Query $query
 			if ($null -ne $resGet -and $resGet.code -eq 0 -and $null -ne $resGet.data -and $resGet.data.hasToday -eq $true) {
 				$alreadyConfirmed = $true
 			}
 			elseif ($null -ne $resGet -and $resGet.code -eq 0 -and $null -ne $resGet.data -and $resGet.data.hasToday -eq $false) {
-				Out-Log -Level 'INFO' -Message "Checking in for $($ident.identity) ($($ident.title))"
+				Out-Log -Level 'INFO' -Message "Checking in for $logIdentity ($($ident.title))"
 				$resPost = Invoke-SkAuthorizedApiRequest -Method 'Post' -Path $postPath -Body $body -Ctx $roleCtx
 				$resGet = Invoke-SkAuthorizedApiRequest -Method 'Get' -Path $getPath -Ctx $roleCtx -Query $query
 			}
@@ -904,9 +908,9 @@ function Invoke-SkAttendanceCore {
 			}
 		}
 		else {
-			Out-Log -Level 'INFO' -Message "Checking in for $($ident.identity) ($($ident.title))"
+			Out-Log -Level 'INFO' -Message "Checking in for $logIdentity ($($ident.title))"
 			$resPost = Invoke-SkAuthorizedApiRequest -Method 'Post' -Path $postPath -Body $body -Ctx $roleCtx
-			Out-Log -Level 'INFO' -Message "Checking status for $($ident.identity) ($($ident.title))"
+			Out-Log -Level 'INFO' -Message "Checking status for $logIdentity ($($ident.title))"
 			$resGet = Invoke-SkAuthorizedApiRequest -Method 'Get' -Path $getPath -Ctx $roleCtx -Query $query
 		}
 
@@ -926,7 +930,7 @@ function Invoke-SkAttendanceCore {
 			$codePost = if ($null -ne $resPost) { $resPost.code } else { 'missing' }
 			$codeGet = if ($null -ne $resGet) { $resGet.code } else { 'missing' }
 			$detail = "Check-in not confirmed (POST: $codePost; GET: $codeGet)"
-			Out-Log -Level 'ERROR' -Message "[$($ident.identity)] $detail"
+			Out-Log -Level 'ERROR' -Message "[$logIdentity] $detail"
 			$Embed.fields += @{ name = $ident.title; value = "$($ident.identity): ERROR $detail"; inline = $true; key = $fieldKey }
 			$itemResults += New-AttendanceItemResult -Kind 'Failed' -Identity $fieldKey -Detail $detail -Reason 'CheckInUnconfirmed'
 			continue
@@ -936,10 +940,10 @@ function Invoke-SkAttendanceCore {
 		$awardText = $awardLines -join "`n"
 		$awardLogText = $awardLines -join ", "
 		if ($isAlready) {
-			Out-Log -Level 'INFO' -Message "[$($ident.identity)] Already checked in. Awards: $awardLogText"
+			Out-Log -Level 'INFO' -Message "[$logIdentity] Already checked in. Awards: $awardLogText"
 		}
 		else {
-			Out-Log -Level 'INFO' -Message "[$($ident.identity)] Check-in success! Awards: $awardLogText"
+			Out-Log -Level 'INFO' -Message "[$logIdentity] Check-in success! Awards: $awardLogText"
 		}
 		if (-not $IsReusing -or -not $isAlready) {
 			$Embed.fields += @{ 'name' = $ident.title; 'value' = "*$($ident.server_name)* - $($ident.nickname)`n$awardText"; 'inline' = $true; 'key' = $fieldKey }
