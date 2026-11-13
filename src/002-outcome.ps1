@@ -7,7 +7,7 @@
 function New-AttendanceItemResult {
 	param(
 		[Parameter(Mandatory = $true)]
-		[ValidateSet('Signed', 'AlreadySigned', 'Failed')]
+		[ValidateSet('Signed', 'AlreadySigned', 'Skipped', 'Failed')]
 		[string]$Kind,
 		[Parameter(Mandatory = $true)]
 		[string]$Identity,
@@ -18,9 +18,9 @@ function New-AttendanceItemResult {
 	if ([string]::IsNullOrWhiteSpace($Identity)) {
 		throw 'An attendance item requires a non-empty identity.'
 	}
-	if ($Kind -eq 'Failed') {
+	if ($Kind -in @('Failed', 'Skipped')) {
 		if ([string]::IsNullOrWhiteSpace($Reason)) {
-			throw 'A failed attendance item must have a reason.'
+			throw 'A failed or skipped attendance item must have a reason.'
 		}
 	}
 	elseif (-not [string]::IsNullOrEmpty($Reason)) {
@@ -75,6 +75,7 @@ function Complete-AttendanceProfileResult {
 
 	$passed = 0
 	$failed = 0
+	$skipped = 0
 	foreach ($item in $itemsArray) {
 		if (-not $item.PSTypeNames.Contains('AnimeAttendance.ItemResult')) {
 			throw 'Only validated attendance items may be aggregated.'
@@ -82,18 +83,22 @@ function Complete-AttendanceProfileResult {
 		switch ($item.Kind) {
 			'Signed' { $passed++ }
 			'AlreadySigned' { $passed++ }
+			'Skipped' { $skipped++ }
 			'Failed' { $failed++ }
 			default { throw "Unknown attendance item outcome: $($item.Kind)" }
 		}
 	}
 
-	$kind = if ($failed -eq 0) { 'Success' } elseif ($passed -eq 0) { 'Failure' } else { 'PartialFailure' }
+	$kind = if ($passed -eq 0 -and $failed -eq 0 -and $skipped -gt 0) { 'Skipped' }
+		elseif ($failed -eq 0) { 'Success' }
+		elseif ($passed -eq 0) { 'Failure' }
+		else { 'PartialFailure' }
 	return [pscustomobject]@{
 		PSTypeName = 'AnimeAttendance.ProfileResult'
 		Kind = $kind
 		Platform = $Platform
 		Items = $itemsArray
-		Reason = if ($kind -eq 'Failure') { 'AllItemsFailed' } else { '' }
+		Reason = if ($kind -eq 'Failure') { 'AllItemsFailed' } elseif ($kind -eq 'Skipped') { 'NoActionableItems' } else { '' }
 		Message = ''
 	}
 }
@@ -101,13 +106,13 @@ function Complete-AttendanceProfileResult {
 function Test-AttendanceProfileResult {
 	param($Result)
 	if ($null -eq $Result -or -not $Result.PSTypeNames.Contains('AnimeAttendance.ProfileResult')) { return $false }
-	if ($Result.Kind -notin @('Success', 'PartialFailure', 'Failure')) { return $false }
+	if ($Result.Kind -notin @('Success', 'PartialFailure', 'Failure', 'Skipped')) { return $false }
 	if ([string]::IsNullOrWhiteSpace([string]$Result.Platform)) { return $false }
 	$items = @($Result.Items)
 	foreach ($item in $items) {
 		if ($null -eq $item -or -not $item.PSTypeNames.Contains('AnimeAttendance.ItemResult')) { return $false }
 		if ([string]::IsNullOrWhiteSpace([string]$item.Identity)) { return $false }
-		if ($item.Kind -eq 'Failed') {
+		if ($item.Kind -in @('Failed', 'Skipped')) {
 			if ([string]::IsNullOrWhiteSpace([string]$item.Reason)) { return $false }
 		}
 		elseif ($item.Kind -in @('Signed', 'AlreadySigned')) {
@@ -121,11 +126,13 @@ function Test-AttendanceProfileResult {
 
 	$passed = @($items | Where-Object { $_.PSTypeNames.Contains('AnimeAttendance.ItemResult') -and $_.Kind -in @('Signed', 'AlreadySigned') }).Count
 	$failed = @($items | Where-Object { $_.PSTypeNames.Contains('AnimeAttendance.ItemResult') -and $_.Kind -eq 'Failed' }).Count
-	if ($passed + $failed -ne $items.Count) { return $false }
+	$skipped = @($items | Where-Object { $_.PSTypeNames.Contains('AnimeAttendance.ItemResult') -and $_.Kind -eq 'Skipped' }).Count
+	if ($passed + $failed + $skipped -ne $items.Count) { return $false }
 	switch ($Result.Kind) {
 		'Success' { $passed -gt 0 -and $failed -eq 0 }
 		'PartialFailure' { $passed -gt 0 -and $failed -gt 0 }
 		'Failure' { $passed -eq 0 -and $failed -gt 0 }
+		'Skipped' { $passed -eq 0 -and $failed -eq 0 -and $skipped -gt 0 }
 	}
 }
 
@@ -134,7 +141,7 @@ function Test-AttendanceRequiresPing {
 	if (-not (Test-AttendanceProfileResult -Result $Result)) {
 		throw 'Cannot derive notification policy from an invalid attendance result.'
 	}
-	return ($Result.Kind -ne 'Success')
+	return ($Result.Kind -in @('Failure', 'PartialFailure'))
 }
 
 function Complete-AttendanceEmbed {
@@ -148,6 +155,7 @@ function Complete-AttendanceEmbed {
 		'Success' { '5635840' }
 		'PartialFailure' { '16753920' }
 		'Failure' { '16711680' }
+		'Skipped' { '8421504' }
 	}
 
 	if (-not $Embed.title -or $Embed.title -eq 'ERROR') {

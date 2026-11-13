@@ -81,6 +81,89 @@ function Get-HoyolabAccountInfo {
 	return @{ Success = $false; Message = $ret.message }
 }
 
+function Get-HoyolabGameRoleClass {
+	param($Game)
+
+	# HoYoLAB activity path and game_biz are separate provider identifiers.
+	# Unknown games bypass this preflight rather than being treated as absent.
+	switch ([string]$Game.game_id) {
+		'sol' { return 'hk4e' }
+		'luna/os' { return 'hkrpg' }
+		'luna/zzz/os' { return 'nap' }
+		default { return $null }
+	}
+}
+
+function Get-HoyolabBoundRoleClasses {
+	param($Cookies, $Config)
+
+	# A game can have a successful /info response with is_sign=false and
+	# total_sign_day=0 despite having no bound character. Check the actual
+	# account's role bindings before attempting first-day sign-in.
+	try {
+		$base = 'https://api-os-takumi.mihoyo.com'
+		$session = New-WebSession -Cookies $Cookies -For $base
+		$reply = Invoke-RestMethod -Method 'Get' -Uri "$base/binding/api/getUserGameRolesByCookie" -Headers @{
+			'Accept' = 'application/json, text/plain, */*'
+			'x-rpc-client_type' = '5'
+		} -UserAgent $Config.user_agent -WebSession $session -ErrorAction Stop
+		if ($null -eq $reply -or $reply.retcode -ne 0 -or $null -eq $reply.data -or
+			$null -eq $reply.data.list) {
+			return @{ Available = $false; Classes = @{} }
+		}
+		$classes = @{}
+		foreach ($role in @($reply.data.list)) {
+			$biz = [string]$role.game_biz
+			if ($biz) {
+				$class = ($biz -split '_')[0]
+				$classes[$class] = $true
+			}
+		}
+		return @{ Available = $true; Classes = $classes }
+	}
+	catch {
+		Out-Log -Level 'WARN' -Message 'Unable to verify bound HoYoLAB game roles; attendance will use game API status.'
+		return @{ Available = $false; Classes = @{} }
+	}
+}
+function Add-HoyolabAttendanceReward {
+	param($Game, $Config, $Headers, $Session, $Info, [string]$InfoUrl, $Embed,
+		[bool]$RefreshInfo = $false, [bool]$IsAlready = $false)
+
+	# Only status determines the attendance result. Both already-signed and
+	# freshly-signed games should show the same real award/count details.
+	try {
+		if ($RefreshInfo) {
+			$Info = Invoke-RestMethod -Method 'Get' -Uri $InfoUrl -Headers $Headers -ContentType 'application/json;charset=UTF-8' -UserAgent $Config.user_agent -WebSession $Session
+		}
+		$rewardUrl = "$($Game.api_base)/event/$($Game.game_id)/home?lang=$($Config.lang)&act_id=$($Game.act_id)"
+		$reward = Invoke-RestMethod -Method 'Get' -Uri $rewardUrl -Headers $Headers -ContentType 'application/json;charset=UTF-8' -UserAgent $Config.user_agent -WebSession $Session
+		if ($null -eq $Info -or $Info.retcode -ne 0 -or $null -eq $Info.data -or
+			$null -eq $reward -or $reward.retcode -ne 0 -or $null -eq $reward.data -or $null -eq $reward.data.awards) {
+			throw 'Reward information unavailable'
+		}
+		$totalDays = 0
+		if (-not [int]::TryParse([string]$Info.data.total_sign_day, [ref]$totalDays) -or $totalDays -lt 1) {
+			throw 'Reward index unavailable'
+		}
+		$awards = @($reward.data.awards)
+		if ($totalDays -gt $awards.Count) { throw 'Reward index unavailable' }
+		$todayReward = $awards[$totalDays - 1]
+		if (-not $todayReward -or -not $todayReward.name) { throw 'Reward entry unavailable' }
+
+		$rewardName = Format-Text -Text $todayReward.name
+		$nl = [char]10
+		$full = "$($Info.data.today)$nl**$($Config.discord_text.total_sign_day)**$nl$totalDays$($Config.discord_text.total_sign_day_unit)$nl**$($Config.discord_text.reward)**$nl$rewardName x$($todayReward.cnt)"
+		$minimal = "$($Info.data.today) ($totalDays)$nl$rewardName x$($todayReward.cnt)"
+		$Embed.fields += @{ name = $Game.name; value = $full; inline = $true; minimal = $minimal }
+		Out-Log -Level 'INFO' -Message "Confirmed reward for $($Game.name): $rewardName x$($todayReward.cnt)"
+	}
+	catch {
+		Out-Log -Level 'WARN' -Message "Reward details unavailable after confirmed HoYoLAB attendance for $($Game.name)."
+		$prefix = if ($IsAlready) { 'Already signed today' } else { 'Signed today' }
+		$Embed.fields += @{ name = $Game.name; value = "$prefix; reward details unavailable"; inline = $true }
+	}
+}
 function Invoke-HoyolabCheckin {
 	param($Profiie, $Config, $Embed, $IsReusing)
 
@@ -92,6 +175,7 @@ function Invoke-HoyolabCheckin {
 	}
 
 	$items = @()
+	$boundRoleClasses = $null
 	$jar = $cookieResult.Jar
 	$ltuid = $cookieResult.ltuid
 	if ($ltuid -and $ltuid -ne 'Unknown') { Register-LogSecret -Secret $ltuid -Label 'ltuid'; Register-GitHubLogMasks }
@@ -147,6 +231,17 @@ function Invoke-HoyolabCheckin {
 		$ret_info = Invoke-RestMethod -Method 'Get' -Uri $api_info_url -Headers $api_headers -ContentType 'application/json;charset=UTF-8' -UserAgent $Config.user_agent -WebSession $session
 		Out-Log -Level 'DEBUG' -Message "Queried info: $(Format-LogObject -InputObject $ret_info)"
 
+		# The HoYoLAB activity returns -10002 with no data when this account
+		# has never created a character for the game. No attendance is possible,
+		# so this is not a failed signing attempt or an account auth error.
+		if ($null -ne $ret_info -and $ret_info.retcode -eq -10002 -and $null -eq $ret_info.data) {
+			Out-Log -Level 'INFO' -Message "No character for $($game.name) on $logLtuid; skipping attendance."
+			# No game character means no attendance item should be shown in
+			# Discord, matching the pre-#3 behavior without pretending success.
+			$items += New-AttendanceItemResult -Kind 'Skipped' -Identity $game.name -Reason 'NoGameCharacter'
+			continue
+		}
+
 		if ($null -eq $ret_info -or ($ret_info.retcode -ne 0 -and $ret_info.retcode -ne -100) -or ($ret_info.retcode -eq 0 -and $null -eq $ret_info.data)) {
 			$Embed.fields += @{ name = $game.name; value = 'Cannot verify attendance status'; inline = $true }
 			$items += New-AttendanceItemResult -Kind 'Failed' -Identity $game.name -Reason 'InvalidResponse' -Detail 'Attendance status unavailable'
@@ -159,12 +254,27 @@ function Invoke-HoyolabCheckin {
 			Continue
 		}
 
-		# Explicit provider status confirms already signed. Do not POST again.
+		# A zero-day /info is not proof of an existing game character.
+		# Only skip when the authoritative role binding list is available
+		# and confirms this game has no bound role. Otherwise retain the
+		# usual first-day sign-in path.
+		$gameRoleClass = Get-HoyolabGameRoleClass -Game $game
+		if ($gameRoleClass -and $ret_info.retcode -eq 0 -and $ret_info.data.is_sign -eq $false -and
+			[string]$ret_info.data.total_sign_day -eq '0') {
+			if ($null -eq $boundRoleClasses) {
+				$boundRoleClasses = Get-HoyolabBoundRoleClasses -Cookies $jar -Config $Config
+			}
+			if ($boundRoleClasses.Available -and -not $boundRoleClasses.Classes.ContainsKey($gameRoleClass)) {
+				Out-Log -Level 'INFO' -Message "No bound character for $($game.name) on $logLtuid; skipping attendance."
+				$items += New-AttendanceItemResult -Kind 'Skipped' -Identity $game.name -Reason 'NoGameCharacter'
+				continue
+			}
+		}
+
+		# AlreadySigned means no POST, not "discard the original reward".
 		if ($ret_info.data.is_sign -eq $true) {
 			$items += New-AttendanceItemResult -Kind 'AlreadySigned' -Identity $game.name
-			if (-not $IsReusing) {
-				$Embed.fields += @{ name = $game.name; value = 'Already signed today'; inline = $true }
-			}
+			Add-HoyolabAttendanceReward -Game $game -Config $Config -Headers $api_headers -Session $session -Info $ret_info -InfoUrl $api_info_url -Embed $Embed -IsAlready $true
 			continue
 		}
 		# 2. Perform sign-in
@@ -181,12 +291,10 @@ function Invoke-HoyolabCheckin {
 			Continue
 		}
 
-		# -10002 is the explicit already-signed response.
+		# A race between GET and POST may still yield already-signed.
 		if ($ret_sign.retcode -eq -10002) {
 			$items += New-AttendanceItemResult -Kind 'AlreadySigned' -Identity $game.name
-			if (-not $IsReusing) {
-				$Embed.fields += @{ name = $game.name; value = 'Already signed today'; inline = $true }
-			}
+			Add-HoyolabAttendanceReward -Game $game -Config $Config -Headers $api_headers -Session $session -Info $ret_info -InfoUrl $api_info_url -Embed $Embed -RefreshInfo $true -IsAlready $true
 			continue
 		}
 		if ($ret_sign.data.gt_result -and -not ($ret_sign.data.gt_result.risk_code -eq 0 -and -not $ret_sign.data.gt_result.is_risk -and $ret_sign.data.gt_result.success -eq 0)) {
@@ -213,30 +321,7 @@ function Invoke-HoyolabCheckin {
 				Out-Log -Level 'WARN' -Message "Optional HoYoLAB re-sign failed for $($game.name)."
 			}
 		}
-		try {
-			$updated = Invoke-RestMethod -Method 'Get' -Uri $api_info_url -Headers $api_headers -ContentType 'application/json;charset=UTF-8' -UserAgent $Config.user_agent -WebSession $session
-			$api_reward_url = "$base_url/event/$($game.game_id)/home?lang=$($Config.lang)&act_id=$act_id"
-			$ret_reward = Invoke-RestMethod -Method 'Get' -Uri $api_reward_url -Headers $api_headers -ContentType 'application/json;charset=UTF-8' -UserAgent $Config.user_agent -WebSession $session
-			if ($null -eq $updated -or $updated.retcode -ne 0 -or $null -eq $updated.data -or $null -eq $ret_reward -or $ret_reward.retcode -ne 0 -or $null -eq $ret_reward.data.awards) {
-				throw 'Reward information unavailable'
-			}
-			$rewardIndex = [int]$updated.data.total_sign_day - 1
-			if ($rewardIndex -lt 0 -or $rewardIndex -ge @($ret_reward.data.awards).Count) {
-				throw 'Reward index unavailable'
-			}
-			$current_reward = $ret_reward.data.awards[$rewardIndex]
-			if (-not $current_reward -or -not $current_reward.name) {
-				throw 'Reward entry unavailable'
-			}
-			$reward_name = Format-Text -Text $current_reward.name
-			$reward_text_full = "$($updated.data.today)`n**$($Config.discord_text.total_sign_day)**`n$($updated.data.total_sign_day)$($Config.discord_text.total_sign_day_unit)`n**$($Config.discord_text.reward)**`n$reward_name x$($current_reward.cnt)"
-			$reward_text_minimal = "$($updated.data.today) ($($updated.data.total_sign_day))`n$reward_name x$($current_reward.cnt)"
-			$Embed.fields += @{ name = $game.name; value = $reward_text_full; inline = $true; minimal = $reward_text_minimal }
-		}
-		catch {
-			Out-Log -Level 'WARN' -Message "Reward details unavailable after confirmed HoYoLAB attendance for $($game.name)."
-			$Embed.fields += @{ name = $game.name; value = 'Signed today; reward details unavailable'; inline = $true }
-		}
+		Add-HoyolabAttendanceReward -Game $game -Config $Config -Headers $api_headers -Session $session -Info $ret_info -InfoUrl $api_info_url -Embed $Embed -RefreshInfo $true
 	}
 
 	return Complete-AttendanceProfileResult -Platform 'hoyolab' -Items $items

@@ -164,27 +164,27 @@ function Send-DiscordNotification {
 				'inline' = $new_f.inline
 			}
 
-			# When existing embeds came from Discord payload, custom `key` is absent.
-			# Fallback-match by (name + first value line) to keep updates stable.
-			if (-not $target_field_map.Contains($fieldKey) -and $new_f.key) {
-				$newFirstLine = ""
-				if ($val) {
-					$newFirstLine = ([string]$val -split "`r?`n")[0]
-				}
+			# Discord strips custom field keys. For game-level fields such as
+			# HoYoLAB, the name is unique, so replace an old placeholder with
+			# the real reward even when editing a previously reused message.
+			# Role fields have explicit keys and can share a name: match by
+			# the first role-identity line instead to avoid cross-role swaps.
+			if (-not $target_field_map.Contains($fieldKey)) {
+				$newFirstLine = if ($val) { ([string]$val -split '\r?\n')[0] } else { '' }
 				foreach ($existingKey in @($target_field_map.Keys)) {
 					$existingField = $target_field_map[$existingKey]
 					if ($existingField.name -ne $new_f.name) { continue }
-					$existingFirstLine = ""
-					if ($existingField.value) {
-						$existingFirstLine = ([string]$existingField.value -split "`r?`n")[0]
+					if (-not $new_f.key) {
+						$fieldKey = $existingKey
+						break
 					}
+					$existingFirstLine = if ($existingField.value) { ([string]$existingField.value -split '\r?\n')[0] } else { '' }
 					if ($existingFirstLine -eq $newFirstLine) {
 						$fieldKey = $existingKey
 						break
 					}
 				}
 			}
-
 			# Update/Add
 			$target_field_map[$fieldKey] = $clean_field
 		}

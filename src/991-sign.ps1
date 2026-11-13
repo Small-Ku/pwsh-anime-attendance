@@ -140,18 +140,20 @@ function Invoke-AnimeAttendance {
 		Complete-AttendanceEmbed -Result $result -Embed $embed | Out-Null
 		$confirmedCount = @($result.Items | Where-Object { $_.Kind -in @('Signed', 'AlreadySigned') }).Count
 		$failedCount = @($result.Items | Where-Object { $_.Kind -eq 'Failed' }).Count
+		$skippedCount = @($result.Items | Where-Object { $_.Kind -eq 'Skipped' }).Count
 		$statusLevel = switch ($result.Kind) {
 			'Success' { 'INFO' }
+			'Skipped' { 'INFO' }
 			'PartialFailure' { 'WARN' }
 			default { 'ERROR' }
 		}
-		Out-Log -Level $statusLevel -Message "Profile #$profile_idx ($platform): $($result.Kind); confirmed=$confirmedCount, failed=$failedCount, reason=$($result.Reason)"
+		Out-Log -Level $statusLevel -Message "Profile #$profile_idx ($platform): $($result.Kind); confirmed=$confirmedCount, failed=$failedCount, skipped=$skippedCount, reason=$($result.Reason)"
 
 		foreach ($bot_name in $bot_results.Keys) {
 			$bot_data = $bot_results[$bot_name]
 			$bot_config = $bot_data.BotConfig
 			if (Test-DiscordBotProfileMatch -BotConfig $bot_config -Profile $profiie -ProfileIndex $profile_idx) {
-				$bot_data.Embeds += $embed
+				if ($result.Kind -ne 'Skipped') { $bot_data.Embeds += $embed }
 				if (Test-AttendanceRequiresPing -Result $result) { $bot_data.AnyNeedPing = $true }
 			}
 		}

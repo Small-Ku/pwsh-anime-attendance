@@ -561,6 +561,29 @@ Describe 'Discord notifications derive from validated outcomes' {
 	}
 }
 
+Describe 'Skipped item outcome contract' {
+	It 'does not classify a non-applicable game as signed or failed' {
+		$skipped = New-AttendanceItemResult -Kind 'Skipped' -Identity 'uncreated-game' -Reason 'NoGameCharacter'
+		$profile = Complete-AttendanceProfileResult -Platform 'hoyolab' -Items @($skipped)
+		$profile.Kind | Should -Be 'Skipped'
+		Test-AttendanceProfileResult -Result $profile | Should -BeTrue
+		Test-AttendanceRequiresPing -Result $profile | Should -BeFalse
+		$profile.Reason | Should -Be 'NoActionableItems'
+	}
+	It 'preserves a failed other game alongside a skipped game' {
+		$items = @(
+			(New-AttendanceItemResult -Kind 'Skipped' -Identity 'uncreated-game' -Reason 'NoGameCharacter'),
+			(New-AttendanceItemResult -Kind 'Failed' -Identity 'failed-game' -Reason 'InvalidResponse')
+		)
+		$result = Complete-AttendanceProfileResult -Platform 'hoyolab' -Items $items
+		$result.Kind | Should -Be 'Failure'
+		Test-AttendanceProfileResult -Result $result | Should -BeTrue
+		Test-AttendanceRequiresPing -Result $result | Should -BeTrue
+	}
+	It 'rejects skipped outcomes without an explicit reason' {
+		{ New-AttendanceItemResult -Kind 'Skipped' -Identity 'uncreated-game' } | Should -Throw
+	}
+}
 Describe 'HoYoLAB returns typed check-in results' {
 	BeforeAll {
 		. "$PSScriptRoot/../src/011-hoyolab.ps1"
@@ -595,16 +618,172 @@ Describe 'HoYoLAB returns typed check-in results' {
 		Test-AttendanceRequiresPing -Result $r | Should -BeTrue
 	}
 
-	It 'reports a confirmed already-signed provider response without a reward fetch' {
+	It 'skips a never-created game character without POST or failure notification' {
+		$embed = Initialize-DiscordEmbed
 		Mock Invoke-RestMethod {
-			if ($Uri -like '*/info?*') { return [pscustomobject]@{ retcode = 0; data = [pscustomobject]@{ sign_cnt_missed = 0; is_sign = $true; total_sign_day = 1; today = 'Today' } } }
-			if ($Uri -like '*/sign?*') { return [pscustomobject]@{ retcode = -10002; message = 'Already signed' } }
-			throw 'Unexpected synthetic request'
+			if ($Uri -like '*/info?*') { return [pscustomobject]@{ retcode = -10002; message = 'No character created'; data = $null } }
+			throw 'POST and reward endpoints must not be called for an absent character'
+		}
+
+		$r = Invoke-HoyolabCheckin -Profiie $script:hoyoProfile -Config $script:hoyoConfig -Embed $embed -IsReusing $false
+		$r.Kind | Should -Be 'Skipped'
+		$r.Items | Should -HaveCount 1
+		$r.Items[0].Kind | Should -Be 'Skipped'
+		$r.Items[0].Reason | Should -Be 'NoGameCharacter'
+		Test-AttendanceProfileResult -Result $r | Should -BeTrue
+		Test-AttendanceRequiresPing -Result $r | Should -BeFalse
+		Complete-AttendanceEmbed -Result $r -Embed $embed | Out-Null
+		@($embed.fields).Count | Should -Be 0
+		Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Method -eq 'Post' }
+	}
+
+	It 'treats unknown status errors as real failures, not absent characters' {
+		Mock Invoke-RestMethod {
+			if ($Uri -like '*/info?*') { return [pscustomobject]@{ retcode = -500001; message = 'Temporary problem'; data = $null } }
+			throw 'No POST may occur'
+		}
+		$r = Invoke-HoyolabCheckin -Profiie $script:hoyoProfile -Config $script:hoyoConfig -Embed (Initialize-DiscordEmbed) -IsReusing $false
+		$r.Kind | Should -Be 'Failure'
+		$r.Items[0].Reason | Should -Be 'InvalidResponse'
+		Test-AttendanceRequiresPing -Result $r | Should -BeTrue
+		Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Method -eq 'Post' }
+	}
+
+	It 'keeps other games successful while skipping a game without characters' {
+		$script:hoyoConfig.games = @(
+			[pscustomobject]@{ name = 'No character'; api_base = 'https://example.invalid'; game_id = 'absent-game'; act_id = 'test'; origin_url = 'https://example.invalid'; referer_url = 'https://example.invalid/' },
+			[pscustomobject]@{ name = 'Signed game'; api_base = 'https://example.invalid'; game_id = 'signed-game'; act_id = 'test'; origin_url = 'https://example.invalid'; referer_url = 'https://example.invalid/' }
+		)
+		Mock Invoke-RestMethod {
+			if ($Uri -like '*/absent-game/info?*') { return [pscustomobject]@{ retcode = -10002; data = $null } }
+			if ($Uri -like '*/signed-game/info?*') { return [pscustomobject]@{ retcode = 0; data = [pscustomobject]@{ is_sign = $true } } }
+			throw 'Unexpected POST or reward request'
 		}
 		$r = Invoke-HoyolabCheckin -Profiie $script:hoyoProfile -Config $script:hoyoConfig -Embed (Initialize-DiscordEmbed) -IsReusing $false
 		$r.Kind | Should -Be 'Success'
+		@($r.Items | Where-Object Kind -eq 'Skipped').Count | Should -Be 1
+		@($r.Items | Where-Object Kind -eq 'AlreadySigned').Count | Should -Be 1
+		Test-AttendanceRequiresPing -Result $r | Should -BeFalse
+	}
+	It 'recognizes the HoYoLAB game identifiers used by the role bindings API' {
+		Get-HoyolabGameRoleClass -Game ([pscustomobject]@{game_id='sol'}) | Should -Be 'hk4e'
+		Get-HoyolabGameRoleClass -Game ([pscustomobject]@{game_id='luna/os'}) | Should -Be 'hkrpg'
+		Get-HoyolabGameRoleClass -Game ([pscustomobject]@{game_id='luna/zzz/os'}) | Should -Be 'nap'
+		Get-HoyolabGameRoleClass -Game ([pscustomobject]@{game_id='unknown'}) | Should -BeNullOrEmpty
+	}
+
+	It 'skips zero-day ZZZ when the account only binds a Star Rail role' {
+		$script:hoyoConfig.games[0].game_id = 'luna/zzz/os'
+		Mock Get-HoyolabBoundRoleClasses { return @{ Available = $true; Classes = @{ hkrpg = $true } } }
+		Mock Invoke-RestMethod {
+			if ($Uri -like '*/info?*') {
+				return [pscustomobject]@{ retcode = 0; data = [pscustomobject]@{ is_sign = $false; total_sign_day = 0; today = 'Synthetic today' } }
+			}
+			throw 'An unbound game must not trigger a sign-in POST or reward lookup'
+		}
+		$embed = Initialize-DiscordEmbed
+		$r = Invoke-HoyolabCheckin -Profiie $script:hoyoProfile -Config $script:hoyoConfig -Embed $embed -IsReusing $false
+		$r.Kind | Should -Be 'Skipped'
+		$r.Items[0].Kind | Should -Be 'Skipped'
+		$r.Items[0].Reason | Should -Be 'NoGameCharacter'
+		$embed.fields | Should -HaveCount 0
+		Test-AttendanceRequiresPing -Result $r | Should -BeFalse
+		Should -Invoke Get-HoyolabBoundRoleClasses -Times 1 -Exactly
+		Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Method -eq 'Post' }
+	}
+
+	It 'does not skip a real ZZZ first-day check-in when a bound role exists' {
+		$script:hoyoConfig.games[0].game_id = 'luna/zzz/os'
+		$script:dayInfoCalls = 0
+		Mock Get-HoyolabBoundRoleClasses { return @{ Available = $true; Classes = @{ nap = $true } } }
+		Mock Invoke-RestMethod {
+			if ($Uri -like '*/info?*') {
+				$script:dayInfoCalls++
+				if ($script:dayInfoCalls -eq 1) {
+					return [pscustomobject]@{ retcode = 0; data = [pscustomobject]@{ is_sign = $false; total_sign_day = 0; today = 'Synthetic today' } }
+				}
+				return [pscustomobject]@{ retcode = 0; data = [pscustomobject]@{ is_sign = $true; total_sign_day = 1; today = 'Synthetic today' } }
+			}
+			if ($Uri -like '*/sign?*') { return [pscustomobject]@{ retcode = 0; message = 'OK' } }
+			if ($Uri -like '*/home?*') { return [pscustomobject]@{ retcode = 0; data = [pscustomobject]@{ awards = @(@{ name = 'First-day item'; cnt = 3 }) } } }
+			throw 'Unexpected request'
+		}
+		$embed = Initialize-DiscordEmbed
+		$r = Invoke-HoyolabCheckin -Profiie $script:hoyoProfile -Config $script:hoyoConfig -Embed $embed -IsReusing $false
+		$r.Kind | Should -Be 'Success'
+		$r.Items[0].Kind | Should -Be 'Signed'
+		$embed.fields | Should -HaveCount 1
+		$embed.fields[0].value | Should -Match 'First-day item x3'
+		Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'Post' }
+	}
+
+	It 'does not silently skip a first-day game when role verification is unavailable' {
+		$script:hoyoConfig.games[0].game_id = 'luna/zzz/os'
+		Mock Get-HoyolabBoundRoleClasses { return @{ Available = $false; Classes = @{} } }
+		Mock Invoke-RestMethod {
+			if ($Uri -like '*/info?*') { return [pscustomobject]@{ retcode = 0; data = [pscustomobject]@{ is_sign = $false; total_sign_day = 0 } } }
+			if ($Uri -like '*/sign?*') { return [pscustomobject]@{ retcode = -500001; message = 'Synthetic failure' } }
+			throw 'Unexpected request'
+		}
+		$r = Invoke-HoyolabCheckin -Profiie $script:hoyoProfile -Config $script:hoyoConfig -Embed (Initialize-DiscordEmbed) -IsReusing $false
+		$r.Kind | Should -Be 'Failure'
+		$r.Items[0].Reason | Should -Be 'CheckInUnconfirmed'
+		Test-AttendanceRequiresPing -Result $r | Should -BeTrue
+	}
+	It 'shows original reward, sign-in day and count for AlreadySigned without POST, including reused embeds' {
+		$script:hoyoConfig.discord_text | Add-Member -NotePropertyName total_sign_day -NotePropertyValue 'Days' -Force
+		$script:hoyoConfig.discord_text | Add-Member -NotePropertyName total_sign_day_unit -NotePropertyValue 'd' -Force
+		$script:hoyoConfig.discord_text | Add-Member -NotePropertyName reward -NotePropertyValue 'Award' -Force
+		Mock Invoke-RestMethod {
+			if ($Uri -like '*/info?*') { return [pscustomobject]@{ retcode = 0; data = [pscustomobject]@{ is_sign = $true; total_sign_day = 2; today = 'Synthetic day' } } }
+			if ($Uri -like '*/home?*') { return [pscustomobject]@{ retcode = 0; data = [pscustomobject]@{ awards = @(@{name='Old reward';cnt=2},@{name='Current reward';cnt=5}) } } }
+			throw 'No POST should occur when info confirms signed'
+		}
+		$embed = Initialize-DiscordEmbed
+		$r = Invoke-HoyolabCheckin -Profiie $script:hoyoProfile -Config $script:hoyoConfig -Embed $embed -IsReusing $true
+		$r.Kind | Should -Be 'Success'
 		$r.Items[0].Kind | Should -Be 'AlreadySigned'
 		Test-AttendanceRequiresPing -Result $r | Should -BeFalse
+		$embed.fields | Should -HaveCount 1
+		$embed.fields[0].value | Should -Be ("Synthetic day" + [char]10 + '**Days**' + [char]10 + '2d' + [char]10 + '**Award**' + [char]10 + 'Current reward x5')
+		$embed.fields[0].minimal | Should -Be ("Synthetic day (2)" + [char]10 + 'Current reward x5')
+		Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Uri -like '*/home?*' }
+		Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Method -eq 'Post' }
+	}
+
+	It 'recovers reward details when POST says already signed after an unsigned status' {
+		$script:hoyoConfig.discord_text | Add-Member -NotePropertyName reward -NotePropertyValue 'Award' -Force
+		$script:infoCalls = 0
+		Mock Invoke-RestMethod {
+			if ($Uri -like '*/info?*') {
+				$script:infoCalls++
+				return [pscustomobject]@{ retcode = 0; data = [pscustomobject]@{ is_sign = ($script:infoCalls -gt 1); total_sign_day = 1; today = 'Day one' } }
+			}
+			if ($Uri -like '*/sign?*') { return [pscustomobject]@{ retcode = -10002; message = 'Already signed' } }
+			if ($Uri -like '*/home?*') { return [pscustomobject]@{ retcode = 0; data = [pscustomobject]@{ awards = @(@{ name = 'Confirmed prize'; cnt = 1 }) } } }
+			throw 'Unexpected request'
+		}
+		$embed = Initialize-DiscordEmbed
+		$r = Invoke-HoyolabCheckin -Profiie $script:hoyoProfile -Config $script:hoyoConfig -Embed $embed -IsReusing $false
+		$r.Kind | Should -Be 'Success'
+		$r.Items[0].Kind | Should -Be 'AlreadySigned'
+		$embed.fields[0].value | Should -Match 'Confirmed prize x1'
+		Should -Invoke Invoke-RestMethod -Times 1 -Exactly -ParameterFilter { $Method -eq 'Post' }
+		Should -Invoke Invoke-RestMethod -Times 2 -Exactly -ParameterFilter { $Uri -like '*/info?*' }
+	}
+
+	It 'preserves an already-signed result even if reward enrichment fails' {
+		Mock Invoke-RestMethod {
+			if ($Uri -like '*/info?*') { return [pscustomobject]@{ retcode = 0; data = [pscustomobject]@{ is_sign = $true; total_sign_day = 1 } } }
+			if ($Uri -like '*/home?*') { throw 'Synthetic reward service outage' }
+			throw 'No POST permitted'
+		}
+		$embed = Initialize-DiscordEmbed
+		$r = Invoke-HoyolabCheckin -Profiie $script:hoyoProfile -Config $script:hoyoConfig -Embed $embed -IsReusing $false
+		$r.Kind | Should -Be 'Success'
+		$r.Items[0].Kind | Should -Be 'AlreadySigned'
+		$embed.fields[0].value | Should -Be 'Already signed today; reward details unavailable'
+		Should -Invoke Invoke-RestMethod -Times 0 -Exactly -ParameterFilter { $Method -eq 'Post' }
 	}
 	It 'does not issue a POST when the initial status confirms already signed' {
 		Mock Invoke-RestMethod {
@@ -727,6 +906,116 @@ Describe 'Attendance entrypoint never treats a missing handler result as success
 	}
 }
 
+Describe 'Discord reuse preserves actual attendance reward details' {
+	BeforeAll {
+		. "$PSScriptRoot/../src/001-discord.ps1"
+	}
+	It 'replaces an old Already signed today field instead of duplicating it' {
+		$script:patchBody = $null
+		Mock Invoke-RestMethod {
+			if ($Method -eq 'Get') {
+				return [pscustomobject]@{
+					embeds = @([pscustomobject]@{
+						title = 'Synthetic user'; color = 5635840; description = 'ID: synthetic'
+						fields = @([pscustomobject]@{ name = 'Synthetic game'; value = 'Already signed today'; inline = $true })
+					})
+				}
+			}
+			if ($Method -eq 'Patch') { $script:patchBody = $Body }
+			return [pscustomobject]@{ id = '111111111111111111' }
+		}
+		$embed = @{ title = 'Synthetic user'; description = 'ID: synthetic'; color = '5635840'; fields = @(
+			@{ name = 'Synthetic game'; value = 'Day 3 | Award 3 x2'; minimal = 'Award 3 x2'; inline = $true }
+		) }
+		$bot = @{ webhook_url = 'https://discord.invalid/webhook'; reuse_msg = '123456789012345678'; minimal = $true; overwrite = $false }
+		Send-DiscordNotification -BotConfig $bot -Embeds @($embed) -NeedPing $false -PingString '' -GlobalConfig @{}
+		$body = $script:patchBody | ConvertFrom-Json
+		$body.embeds.Count | Should -Be 1
+		@($body.embeds[0].fields).Count | Should -Be 1
+		$body.embeds[0].fields[0].value | Should -Be 'Award 3 x2'
+	}
+	It 'replaces stale two-account HoYoLAB embeds in overwrite/minimal mode' {
+		$script:capturedPatch = $null
+		$script:patchCount = 0
+		Mock Invoke-RestMethod {
+			if ($Method -eq 'Get') {
+				return [pscustomobject]@{ embeds = @(
+					[pscustomobject]@{
+						title = 'Account A'; description = 'Account A ref'; color = 5635840
+						fields = @(
+							[pscustomobject]@{ name = 'Game One'; value = 'Already signed today'; inline = $true },
+							[pscustomobject]@{ name = 'Game Two'; value = 'Already signed today'; inline = $true },
+							[pscustomobject]@{ name = 'Game Three'; value = 'Already signed today'; inline = $true }
+						)
+					},
+					[pscustomobject]@{
+						title = 'Account B'; description = 'Account B ref'; color = 16753920
+						fields = @(
+							[pscustomobject]@{ name = 'Game One'; value = 'Cannot verify attendance status'; inline = $true },
+							[pscustomobject]@{ name = 'Game Two'; value = 'Already signed today'; inline = $true },
+							[pscustomobject]@{ name = 'Game Three'; value = 'Already signed today'; inline = $true }
+						)
+					}
+				) }
+			}
+			if ($Method -eq 'Patch') {
+				$script:patchCount++
+				$script:capturedPatch = $Body
+				return [pscustomobject]@{ id = '123456789012345678' }
+			}
+			throw 'Unexpected POST; overwrite must edit the existing message'
+		}
+		$embeds = @(
+			@{ title = 'Account A'; description = 'Account A ref'; color = '5635840'; fields = @(
+				@{ name = 'Game One'; value = 'Full reward one x1'; minimal = 'Reward one x1'; inline = $true },
+				@{ name = 'Game Two'; value = 'Full reward two x2'; minimal = 'Reward two x2'; inline = $true },
+				@{ name = 'Game Three'; value = 'Full reward three x3'; minimal = 'Reward three x3'; inline = $true }
+			) },
+			@{ title = 'Account B'; description = 'Account B ref'; color = '5635840'; fields = @(
+				@{ name = 'Game Two'; value = 'Full reward four x4'; minimal = 'Reward four x4'; inline = $true }
+			) }
+		)
+		$bot = @{ webhook_url = 'https://discord.invalid/webhook'; reuse_msg = '123456789012345678'; minimal = $true; overwrite = $true }
+		Send-DiscordNotification -BotConfig $bot -Embeds $embeds -NeedPing $false -PingString '' -GlobalConfig @{}
+		$script:patchCount | Should -Be 1
+		$body = $script:capturedPatch | ConvertFrom-Json
+		@($body.embeds).Count | Should -Be 2
+		@($body.embeds[0].fields).Count | Should -Be 3
+		@($body.embeds[1].fields).Count | Should -Be 1
+		$body.embeds[0].color | Should -Be 5635840
+		$body.embeds[1].color | Should -Be 5635840
+		$body.embeds[1].fields[0].name | Should -Be 'Game Two'
+		$body.embeds[1].fields[0].value | Should -Be 'Reward four x4'
+		@($body.embeds | ForEach-Object fields | ForEach-Object value | Where-Object { $_ -match 'Already signed today|Cannot verify attendance status|ERROR' }).Count | Should -Be 0
+		$body.content | Should -Be ''
+	}
+	It 'keeps two same-game role fields distinct while updating their awards' {
+		$script:patchBody = $null
+		Mock Invoke-RestMethod {
+			if ($Method -eq 'Get') {
+				return [pscustomobject]@{ embeds = @([pscustomobject]@{
+					title = 'Synthetic user'; color = 5635840; description = 'ID: synthetic'
+					fields = @(
+						[pscustomobject]@{ name = 'Same game'; value = 'Server A - Role One' + [char]10 + 'Old reward x1'; inline = $true },
+						[pscustomobject]@{ name = 'Same game'; value = 'Server B - Role Two' + [char]10 + 'Old reward x2'; inline = $true }
+					)
+				}) }
+			}
+			if ($Method -eq 'Patch') { $script:patchBody = $Body }
+			return [pscustomobject]@{ id = '111111111111111111' }
+		}
+		$embed = @{ title = 'Synthetic user'; description = 'ID: synthetic'; color = '5635840'; fields = @(
+			@{ name = 'Same game'; key = 'role-a'; value = 'Server A - Role One' + [char]10 + 'New reward x3'; inline = $true },
+			@{ name = 'Same game'; key = 'role-b'; value = 'Server B - Role Two' + [char]10 + 'New reward x4'; inline = $true }
+		) }
+		$bot = @{ webhook_url = 'https://discord.invalid/webhook'; reuse_msg = '123456789012345678'; minimal = $false; overwrite = $false }
+		Send-DiscordNotification -BotConfig $bot -Embeds @($embed) -NeedPing $false -PingString '' -GlobalConfig @{}
+		$body = $script:patchBody | ConvertFrom-Json
+		@($body.embeds[0].fields).Count | Should -Be 2
+		@($body.embeds[0].fields.value | Where-Object {$_ -match 'New reward x3'}).Count | Should -Be 1
+		@($body.embeds[0].fields.value | Where-Object {$_ -match 'New reward x4'}).Count | Should -Be 1
+	}
+}
 Describe 'Discord recovery removes stale failure fields' {
 	BeforeAll {
 		. "$PSScriptRoot/../src/001-discord.ps1"
