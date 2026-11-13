@@ -66,8 +66,33 @@ function ConvertFrom-SkRequestError {
 	}
 	$code = if ($statusCode -gt 0) { - $statusCode } else { -1 }
 	$msg = if ($ErrorRecord.Exception.Message) { $ErrorRecord.Exception.Message } else { "Request Failed" }
+	$diagnostic = @{
+		Status = $statusCode
+		BodyKind = 'unavailable'
+		Edge = 'unknown'
+		Challenge = $false
+	}
 
 	if ($ErrorRecord.Exception.Response) {
+		# Preserve safe transport diagnostics, not raw HTML/cookies/tokens or
+		# request headers. HTTP 403 may come from the gateway instead of Skland.
+		$response = $ErrorRecord.Exception.Response
+		try {
+			$contentType = [string]$response.Content.Headers.ContentType.MediaType
+			if (-not $contentType) { $contentType = [string]$response.ContentType }
+			if ($contentType -match 'json') { $diagnostic.BodyKind = 'json' }
+			elseif ($contentType -match 'html') { $diagnostic.BodyKind = 'html' }
+			elseif ($contentType -match 'text') { $diagnostic.BodyKind = 'text' }
+		}
+		catch {}
+		try {
+			$headers = $response.Headers
+			if ($headers) {
+				if ($headers.ToString() -match '(?im)^cf-ray\s*:') { $diagnostic.Edge = 'cloudflare' }
+				elseif ($headers.ToString() -match '(?im)^server\s*:\s*cloudflare') { $diagnostic.Edge = 'cloudflare' }
+			}
+		}
+		catch {}
 		try {
 			$respBody = $null
 			if ($ErrorRecord.Exception.Response.Content) {
@@ -80,19 +105,46 @@ function ConvertFrom-SkRequestError {
 					$respBody = $reader.ReadToEnd()
 				}
 			}
+			# PowerShell may have consumed the failed response body before
+			# throwing. In that case ErrorDetails.Message retains the JSON.
+			if (-not $respBody -and $ErrorRecord.ErrorDetails.Message) {
+				$respBody = [string]$ErrorRecord.ErrorDetails.Message
+			}
 			if ($respBody) {
-				$json = $respBody | ConvertFrom-Json
-				if ($null -ne $json.code) {
+				if ($respBody -match '(?i)cloudflare|cf[-_]ray|challenge-platform|error\s*1020|access\s*denied') {
+					$diagnostic.Challenge = $true
+					if ($respBody -match '(?i)cloudflare|cf[-_]ray|challenge-platform') { $diagnostic.Edge = 'cloudflare' }
+				}
+				$json = $respBody | ConvertFrom-Json -ErrorAction SilentlyContinue
+				if ($json) {
+					$diagnostic.ResponseFields = @($json.PSObject.Properties.Name | Where-Object { $_ -in @(
+						'code', 'status', 'statusCode', 'message', 'msg', 'error', 'error_description', 'detail', 'reason', 'data', 'success'
+					) })
+					$errorText = @($json.message, $json.msg, $json.error, $json.error_description, $json.reason) |
+						Where-Object { $_ -is [string] } | Select-Object -First 1
+					if ($errorText -match '(?i)already|signed|\u5df2\u7b7e\u5230|\u5df2\u7c3d\u5230') { $diagnostic.ReasonClass = 'already-signed' }
+					elseif ($errorText -match '(?i)sign|signature|\u7b7e\u540d|\u7c3d\u540d') { $diagnostic.ReasonClass = 'signature' }
+					elseif ($errorText -match '(?i)risk|captcha|challenge|verify|\u98ce\u63a7|\u98a8\u63a7') { $diagnostic.ReasonClass = 'risk-or-challenge' }
+					elseif ($errorText -match '(?i)role|channel|account|uid|\u89d2\u8272|\u6e20\u9053') { $diagnostic.ReasonClass = 'role-or-account' }
+					elseif ($errorText -match '(?i)forbidden|permission|denied|access|\u6388\u6743|\u6388\u6b0a') { $diagnostic.ReasonClass = 'permission' }
+					elseif ($errorText -match '(?i)device|dId|\u8bbe\u5907|\u8a2d\u5099') { $diagnostic.ReasonClass = 'device' }
+					elseif ($errorText -match '(?i)frequency|frequent|limit|\u9891\u7e41|\u983b\u7e41') { $diagnostic.ReasonClass = 'frequency' }
+					elseif ($errorText -match '(?i)request|parameter|payload|invalid|\u53c2\u6570|\u53c3\u6578') { $diagnostic.ReasonClass = 'invalid-request' }
+					elseif ($errorText) { $diagnostic.ReasonClass = 'unclassified' }
+					else { $diagnostic.ReasonClass = 'missing' }
+				}
+				if ($null -ne $json -and $null -ne $json.code) {
 					$json | Add-Member -NotePropertyName __HttpStatus -NotePropertyValue $statusCode -Force
+					$json | Add-Member -NotePropertyName __TransportDiagnostic -NotePropertyValue $diagnostic -Force
 					return $json
 				}
-				if ($json.message) { $msg = $json.message }
+				if ($json -and $json.message) { $msg = $json.message }
 			}
 		}
 		catch {}
 	}
 
-	return @{ code = $code; message = $msg; __TransportFailure = $true; __HttpStatus = $statusCode }
+	return @{ code = $code; message = $msg; __TransportFailure = $true; __HttpStatus = $statusCode; __TransportDiagnostic = $diagnostic }
 }
 
 if (-not $script:SkEndfieldResourceNameMapByLang) {
@@ -187,7 +239,10 @@ function Get-SkProviderProfile {
 					platform = '3'; vName = '1.0.0'; origin = 'https://www.skland.com'; referer = 'https://www.skland.com/'
 					user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36'
 				}
-				signature = @{ platform = '3'; vName = '1.0.0' }
+				signature = @{
+					platform = '3'; vName = '1.0.0'
+					arknightsUserAgent = 'Skland/1.5.1 (com.hypergryph.skland; build:100501001; Android 34; ) Okhttp/4.11.0'
+				}
 				paths = @{
 					refresh = '/web/v1/auth/refresh'; user = '/web/v1/user'; binding = '/api/v1/game/player/binding'
 					attendance = @{
@@ -247,6 +302,29 @@ function Invoke-SkPassportRequest {
 	catch { return ConvertFrom-SkRequestError -ErrorRecord $_ }
 }
 
+function Get-SkGameSignatureOptions {
+	param($Ctx, [string]$Path)
+
+	if ($Ctx.ProviderProfile.name -ne 'skland') { return $null }
+	# The game-specific app version belongs to the signed request contract.
+	# The existing user config may already track a newer Skland 1.x release.
+	if ($Ctx.GameConfig.app_code -eq 'arknights' -and $Path -eq '/api/v1/game/attendance') {
+		# The Arknights attendance API uses the Skland app request profile,
+		# distinct from Endfield's web profile. Cred generation continues to
+		# use the separately configured passport user agent and device ID.
+		return @{
+			platform = '1'
+			vName = '1.5.1'
+			dId = [string]$Ctx.DId
+			userAgent = [string]$Ctx.ProviderProfile.signature.arknightsUserAgent
+			appRequest = $true
+		}
+	}
+	if ($Ctx.GameConfig.app_code -eq 'endfield' -and $Path -eq '/api/v1/game/endfield/attendance') {
+		return @{ platform = '3'; vName = '1.0.0'; dId = '' }
+	}
+	return $null
+}
 function Invoke-SkApiRequest {
 	param($Method, [string]$Path, $Body, $Ctx, $Query)
 
@@ -272,6 +350,9 @@ function Invoke-SkApiRequest {
 	$referer = $Ctx.GameConfig.referer_url
 	$origin = $Ctx.GameConfig.origin_url
 	$userAgent = $Ctx.PlatformConfig.user_agent
+	$requestDId = $Ctx.DId
+	$sendEmptyDId = $false
+	$isAppAttendanceRequest = $false
 	$isAuthWebRequest = $false
 	if ($Ctx.ProviderProfile.auth -and $Ctx.ProviderProfile.auth.user_agent) {
 		$isAuthWebRequest = ($Path -eq $Ctx.ProviderProfile.auth.credPath) -or ($Path -eq $Ctx.ProviderProfile.paths.refresh)
@@ -283,6 +364,18 @@ function Invoke-SkApiRequest {
 		$origin = $Ctx.ProviderProfile.auth.origin
 		$userAgent = $Ctx.ProviderProfile.auth.user_agent
 	}
+	elseif ($gameSignature = Get-SkGameSignatureOptions -Ctx $Ctx -Path $Path) {
+		$platform = $gameSignature.platform
+		$vName = $gameSignature.vName
+		if ($gameSignature.ContainsKey('dId')) {
+			$requestDId = $gameSignature.dId
+			$sendEmptyDId = $true
+		}
+		if ($gameSignature.appRequest) {
+			$isAppAttendanceRequest = $true
+			$userAgent = $gameSignature.userAgent
+		}
+	}
 
 	$currTs = ([DateTimeOffset]::Now.ToUnixTimeSeconds() + $Ctx.TimeOffset).ToString()
 	$bodyText = ConvertTo-SkCompactJson -Value $Body
@@ -293,23 +386,44 @@ function Invoke-SkApiRequest {
 		'timestamp' = $currTs; 'Origin' = $origin
 		'Sec-Fetch-Dest' = 'empty'; 'Sec-Fetch-Mode' = 'cors'; 'Sec-Fetch-Site' = 'same-site'
 	}
-	if ($Ctx.DId) { $headers['dId'] = $Ctx.DId }
+	if ($isAppAttendanceRequest) {
+		# Do not claim to be a browser CORS request while presenting an
+		# Android Skland app identity to the attendance endpoint.
+		foreach ($header in @('Origin', 'Referer', 'Sec-Fetch-Dest', 'Sec-Fetch-Mode', 'Sec-Fetch-Site')) {
+			[void]$headers.Remove($header)
+		}
+	}
+	if ($requestDId -or $sendEmptyDId) { $headers['dId'] = [string]$requestDId }
 	if ($Ctx.Cred) { $headers['cred'] = $Ctx.Cred }
 	if ($Ctx.SkGameRole) { $headers['sk-game-role'] = $Ctx.SkGameRole }
 	if ($Ctx.ProviderProfile.passport.x_requested_with -and $Path -ne $Ctx.ProviderProfile.auth.credPath) { $headers['x-requested-with'] = $Ctx.ProviderProfile.passport.x_requested_with }
 	if ($Ctx.Token -and $Path) {
-		$headers['sign'] = Get-SkSignature -Path $Path -QueryString $queryString -Body $bodyText -Timestamp $currTs -Token $Ctx.Token -Platform $platform -VName $vName -DId $Ctx.DId
+		$headers['sign'] = Get-SkSignature -Path $Path -QueryString $queryString -Body $bodyText -Timestamp $currTs -Token $Ctx.Token -Platform $platform -VName $vName -DId $requestDId
 	}
 
 	$params = @{ Method = $Method; Uri = $uri; Headers = $headers; UserAgent = $userAgent; ContentType = 'application/json'; ErrorAction = 'Stop' }
 	if ($Method -ne 'Get' -or ($bodyText -ne '')) { $params.Body = $bodyText }
+	# The provider returns HTTP 403 *with a valid JSON body* for its
+	# AlreadySigned (10001) outcome. On PowerShell 7, parse that body normally
+	# rather than losing it in the exception path and inventing code -403.
+	# PowerShell 5.1 lacks SkipHttpErrorCheck and retains the error parser.
+	if ($PSVersionTable.PSVersion.Major -ge 7 -and $Ctx.ProviderProfile.name -eq 'skland' -and
+		$Method -eq 'Post' -and $Path -eq '/api/v1/game/attendance') {
+		$params.SkipHttpErrorCheck = $true
+	}
 
 	try {
 		$ret = Invoke-RestMethod @params
 		Out-Log -Level 'DEBUG' -Message "[$($Ctx.ProviderProfile.name)] ${Method} ${uri}: $(Format-LogObject -InputObject $ret)"
 		return $ret
 	}
-	catch { return ConvertFrom-SkRequestError -ErrorRecord $_ }
+	catch {
+		$failure = ConvertFrom-SkRequestError -ErrorRecord $_
+		if ($failure.__TransportDiagnostic) {
+			$script:SkLastHttpDiagnostic = $failure.__TransportDiagnostic
+		}
+		return $failure
+	}
 }
 
 function Test-SkAuthenticationRejection {
@@ -446,6 +560,66 @@ function Expand-SkRoles {
 	return $roles
 }
 
+function Get-SkAttendanceState {
+	param(
+		[string]$Provider,
+		[string]$AppCode,
+		$Response
+	)
+
+	if ($null -eq $Response -or $Response.code -ne 0 -or $null -eq $Response.data) { return 'Unknown' }
+	$data = $Response.data
+	if ($Provider -eq 'skland' -and $AppCode -eq 'arknights') {
+		# Arknights returns calendar[] and records[], not Endfield's hasToday.
+		# Use the API server's currentTs and the game's UTC+8 calendar day.
+		$serverTs = 0L
+		if (-not [long]::TryParse([string]$data.currentTs, [ref]$serverTs) -or $serverTs -le 0) { return 'Unknown' }
+		try { $serverDay = [DateTimeOffset]::FromUnixTimeSeconds($serverTs).ToOffset([TimeSpan]::FromHours(8)) }
+		catch { return 'Unknown' }
+
+		$today = $serverDay.Date
+		foreach ($record in @($data.records)) {
+			if ($null -eq $record) { continue }
+			$recordTs = 0L
+			if (-not [long]::TryParse([string]$record.ts, [ref]$recordTs) -or $recordTs -le 0) { continue }
+			try {
+				if ([DateTimeOffset]::FromUnixTimeSeconds($recordTs).ToOffset([TimeSpan]::FromHours(8)).Date -eq $today) {
+					return 'Signed'
+				}
+			}
+			catch { continue }
+		}
+
+		$calendar = @($data.calendar)
+		if ($calendar.Count -ge $serverDay.Day) {
+			$todayEntry = $calendar[$serverDay.Day - 1]
+			if ($null -ne $todayEntry -and $todayEntry.done -is [bool]) {
+				return $(if ($todayEntry.done) { 'Signed' } else { 'NotSigned' })
+			}
+		}
+		return 'Unknown'
+	}
+
+	if ($null -eq $data.hasToday -or $data.hasToday -isnot [bool]) { return 'Unknown' }
+	return $(if ($data.hasToday) { 'Signed' } else { 'NotSigned' })
+}
+function Test-SkAlreadySignedResponse {
+	param(
+		[string]$Provider,
+		[string]$AppCode,
+		$Response
+	)
+
+	# Arknights can return provider code 10001 and "already signed" even
+	# when this role's GET calendar remains unsigned. The explicit POST
+	# confirmation is authoritative for the sign-in outcome, while the
+	# calendar still controls which reward details are actually available.
+	# Never accept code 10001 without a matching message, nor apply this
+	# to Endfield (which has a separate API and schema).
+	if ($Provider -ne 'skland' -or $AppCode -ne 'arknights' -or $null -eq $Response) { return $false }
+	if ([string]$Response.code -ne '10001') { return $false }
+	return [bool]([string]$Response.message -match '(?i)already\s*(?:signed|checked)|signed\s*today|\u5df2\u7b7e\u5230|\u5df2\u7c3d\u5230|\u8bf7\u52ff\u91cd\u590d\u7b7e\u5230|\u8acb\u52ff\u91cd\u8907\u7c3d\u5230')
+}
 function Resolve-SkAttendanceEndpoints {
 	param($Ctx, $Role)
 	$att = $Ctx.ProviderProfile.paths.attendance
@@ -471,7 +645,7 @@ function Build-SkIdentity {
 }
 
 function Resolve-SkAwardLines {
-	param($Data, $Ctx)
+	param($Data, $Ctx, [switch]$UseCalendarToday)
 	function New-Line([string]$Name, $Count) {
 		if ([string]::IsNullOrWhiteSpace($Name)) { return $null }
 		$safeName = Format-Text -Text $Name
@@ -525,6 +699,33 @@ function Resolve-SkAwardLines {
 		}
 	}
 
+	# Arknights can confirm an already-completed Bilibili sign-in using
+	# code 10001 while GET records[] and calendar[].done are empty/false.
+	# Its calendar still describes today's scheduled resource and quantity.
+	# Only use this when the caller has confirmed the provider's explicit
+	# already-signed message. Do not imply it came from a POST award receipt.
+	if ($lines.Count -eq 0 -and $UseCalendarToday -and $Ctx.ProviderProfile.name -eq 'skland' -and
+		$Ctx.GameConfig.app_code -eq 'arknights' -and $null -ne $Data -and $null -ne $Data.resourceInfoMap) {
+		$serverTs = 0L
+		if ([long]::TryParse([string]$Data.currentTs, [ref]$serverTs) -and $serverTs -gt 0) {
+			try {
+				$serverDate = [DateTimeOffset]::FromUnixTimeSeconds($serverTs).ToOffset([TimeSpan]::FromHours(8))
+				$calendar = @($Data.calendar)
+				if ($calendar.Count -ge $serverDate.Day) {
+					$entry = $calendar[$serverDate.Day - 1]
+					$resourceId = if ($entry) { [string]$entry.resourceId } else { '' }
+					if ($resourceId) {
+						$info = $Data.resourceInfoMap.$resourceId
+						if ($info -and $info.name) {
+							$line = New-Line -Name $info.name -Count $entry.count
+							if ($line) { $lines += $line }
+						}
+					}
+				}
+			}
+			catch { }
+		}
+	}
 	if ($lines.Count -eq 0) {
 		return @('Reward detail unavailable from provider API.')
 	}
@@ -880,51 +1081,58 @@ function Invoke-SkAttendanceCore {
 		$ep = Resolve-SkAttendanceEndpoints -Ctx $roleCtx -Role $role
 		$postPath = $ep.post.Replace('{app_code}', $game.app_code)
 		$getPath = $ep.get.Replace('{app_code}', $game.app_code)
-		$body = if ($ep.body -eq 'uid_gameId') { @{ uid = $role.uid; gameId = $role.gameId } } else { '' }
-		$query = if ($ep.query -eq 'uid_gameId') { @{ uid = $role.uid; gameId = $role.gameId } } else { $null }
+		# Arknights gameId selects the binding channel (official/Bilibili),
+		# not the shared top-level game category.
+		$attendanceGameId = if ($Provider -eq 'skland' -and $role.appCode -eq 'arknights' -and
+			-not [string]::IsNullOrWhiteSpace([string]$role.channelMasterId)) { $role.channelMasterId } else { $role.gameId }
+		$body = if ($ep.body -eq 'uid_gameId') { @{ uid = $role.uid; gameId = $attendanceGameId } } else { '' }
+		$query = if ($ep.query -eq 'uid_gameId') { @{ uid = $role.uid; gameId = $attendanceGameId } } else { $null }
 
 		$resPost = $null
 		$resGet = $null
 		$alreadyConfirmed = $false
-		if ($Provider -eq 'skport') {
-			# Skport exposes a reliable "hasToday" status. Check before POST:
-			# it avoids duplicate writes and refuses to sign if status/auth is unknown.
-			Out-Log -Level 'INFO' -Message "Checking status for $logIdentity ($($ident.title))"
-			$resGet = Invoke-SkAuthorizedApiRequest -Method 'Get' -Path $getPath -Ctx $roleCtx -Query $query
-			if ($null -ne $resGet -and $resGet.code -eq 0 -and $null -ne $resGet.data -and $resGet.data.hasToday -eq $true) {
-				$alreadyConfirmed = $true
-			}
-			elseif ($null -ne $resGet -and $resGet.code -eq 0 -and $null -ne $resGet.data -and $resGet.data.hasToday -eq $false) {
-				Out-Log -Level 'INFO' -Message "Checking in for $logIdentity ($($ident.title))"
-				$resPost = Invoke-SkAuthorizedApiRequest -Method 'Post' -Path $postPath -Body $body -Ctx $roleCtx
-				$resGet = Invoke-SkAuthorizedApiRequest -Method 'Get' -Path $getPath -Ctx $roleCtx -Query $query
-			}
-			else {
-				$reason = if (Test-SkAuthenticationRejection -Response $resGet) { 'AuthenticationFailed' } else { 'StatusUnavailable' }
-				Out-Log -Level 'ERROR' -Message "Cannot verify Skport attendance state for $($ident.title)."
-				$Embed.fields += @{ name = $ident.title; value = 'Attendance status unavailable; no check-in attempted'; inline = $true; key = $fieldKey }
-				$itemResults += New-AttendanceItemResult -Kind 'Failed' -Identity $fieldKey -Detail 'Initial attendance status unavailable' -Reason $reason
-				continue
-			}
+		# Both platforms expose a readable status endpoint, but the response
+		# schema differs by game. Only POST after an explicit "not signed" state.
+		Out-Log -Level 'INFO' -Message "Checking status for $logIdentity ($($ident.title))"
+		$resGet = Invoke-SkAuthorizedApiRequest -Method 'Get' -Path $getPath -Ctx $roleCtx -Query $query
+		$initialState = Get-SkAttendanceState -Provider $Provider -AppCode $role.appCode -Response $resGet
+		if ($initialState -eq 'Signed') {
+			$alreadyConfirmed = $true
 		}
-		else {
+		elseif ($initialState -eq 'NotSigned') {
 			Out-Log -Level 'INFO' -Message "Checking in for $logIdentity ($($ident.title))"
 			$resPost = Invoke-SkAuthorizedApiRequest -Method 'Post' -Path $postPath -Body $body -Ctx $roleCtx
-			Out-Log -Level 'INFO' -Message "Checking status for $logIdentity ($($ident.title))"
 			$resGet = Invoke-SkAuthorizedApiRequest -Method 'Get' -Path $getPath -Ctx $roleCtx -Query $query
+		}
+		else {
+			$reason = if (Test-SkAuthenticationRejection -Response $resGet) { 'AuthenticationFailed' } else { 'StatusUnavailable' }
+			Out-Log -Level 'ERROR' -Message "Cannot verify $Provider attendance state for $($ident.title)."
+			$Embed.fields += @{ name = $ident.title; value = 'Attendance status unavailable; no check-in attempted'; inline = $true; key = $fieldKey }
+			$itemResults += New-AttendanceItemResult -Kind 'Failed' -Identity $fieldKey -Detail 'Initial attendance status unavailable' -Reason $reason
+			continue
 		}
 
 		$data = $null
 		$isAlready = $alreadyConfirmed
+		$useCalendarToday = $false
 		if ($alreadyConfirmed) {
 			$data = $resGet.data
 		}
 		elseif ($null -ne $resPost -and $resPost.code -eq 0) {
 			$data = $resPost.data
 		}
-		elseif ($null -ne $resGet -and $resGet.code -eq 0 -and $null -ne $resGet.data -and $resGet.data.hasToday -eq $true) {
+		elseif ((Get-SkAttendanceState -Provider $Provider -AppCode $role.appCode -Response $resGet) -eq 'Signed') {
 			$data = $resGet.data
 			$isAlready = $true
+		}
+		elseif (Test-SkAlreadySignedResponse -Provider $Provider -AppCode $role.appCode -Response $resPost) {
+			# The provider explicitly confirmed attendance. GET records[] may
+			# still appear unsigned on Bilibili, but today's own calendar
+			# describes the scheduled reward (not an actual POST receipt).
+			$data = if ($null -ne $resGet -and $resGet.code -eq 0) { $resGet.data } else { $null }
+			$isAlready = $true
+			$useCalendarToday = $true
+			Out-Log -Level 'INFO' -Message "[$logIdentity] Provider confirms already signed."
 		}
 		else {
 			$codePost = if ($null -ne $resPost) { $resPost.code } else { 'missing' }
@@ -936,7 +1144,7 @@ function Invoke-SkAttendanceCore {
 			continue
 		}
 		$itemResults += New-AttendanceItemResult -Kind $(if ($isAlready) { 'AlreadySigned' } else { 'Signed' }) -Identity $fieldKey
-		$awardLines = Resolve-SkAwardLines -Data $data -Ctx $roleCtx
+		$awardLines = Resolve-SkAwardLines -Data $data -Ctx $roleCtx -UseCalendarToday:$useCalendarToday
 		$awardText = $awardLines -join "`n"
 		$awardLogText = $awardLines -join ", "
 		if ($isAlready) {
@@ -945,9 +1153,9 @@ function Invoke-SkAttendanceCore {
 		else {
 			Out-Log -Level 'INFO' -Message "[$logIdentity] Check-in success! Awards: $awardLogText"
 		}
-		if (-not $IsReusing -or -not $isAlready) {
+		# Include the actual reward even on reused messages; the role key
+		# lets Discord update the matching field rather than drop the result.
 			$Embed.fields += @{ 'name' = $ident.title; 'value' = "*$($ident.server_name)* - $($ident.nickname)`n$awardText"; 'inline' = $true; 'key' = $fieldKey }
-		}
 	}
 
 	return Complete-AttendanceProfileResult -Platform $Provider -Items $itemResults
